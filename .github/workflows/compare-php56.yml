@@ -1,0 +1,237 @@
+name: compare-php56-source-bases
+
+# Commit this single file on the PHP 5.6 fork branch; the push event runs it once.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - PHP-5.6-CVE-2026-109618-109619
+    paths:
+      - .github/workflows/compare-php56.yml
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      TARGET_BRANCH: PHP-5.6-CVE-2026-109618-109619
+      PATCH_FILE: security-backports/php-5.6.40-CVE-2026-109618-109619.patch
+      RELEASE_SHA256: 1369a51eee3995d7fbd1c5342e5cc917760e276d561595b6052b21ace2656d1c
+    steps:
+      - name: Checkout your fork's PHP source
+        uses: actions/checkout@v4
+        with:
+          ref: PHP-5.6-CVE-2026-109618-109619
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Prepare report directory
+        shell: bash
+        run: mkdir -p comparison
+
+      - name: Fetch the actual official PHP 5.6.40 Git tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$PATCH_FILE"
+          git fetch --depth=1 https://github.com/php/php-src.git refs/tags/php-5.6.40
+          OFFICIAL="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          echo "OFFICIAL_SHA=$OFFICIAL" >> "$GITHUB_ENV"
+          echo "FORK_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          mkdir -p comparison/upstream-git
+          git archive "$OFFICIAL" | tar -x -C comparison/upstream-git
+          git diff --name-status "$OFFICIAL" HEAD -- > comparison/all-tree-differences.txt
+          echo '[Official PHP 5.6.40 tag]' "$OFFICIAL"
+          echo '[Your fork HEAD]' "$(git rev-parse HEAD)"
+
+      - name: Fetch and verify the official PHP 5.6.40 distribution archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive=comparison/php-5.6.40.tar.xz
+          ok=0
+          for url in \
+            'https://museum.php.net/php5/php-5.6.40.tar.xz' \
+            'https://www.php.net/distributions/php-5.6.40.tar.xz'; do
+            echo "Trying $url"
+            if curl -fLsS --retry 2 --connect-timeout 15 --max-time 100 \
+              --output "$archive" "$url" && \
+              echo "$RELEASE_SHA256  $archive" | sha256sum -c -; then
+              ok=1
+              break
+            fi
+          done
+          if [[ "$ok" == 1 ]]; then
+            mkdir -p comparison/release
+            tar -xJf "$archive" -C comparison/release
+            echo 'RELEASE_OK=true' >> "$GITHUB_ENV"
+          else
+            echo '::warning::Official release archive unavailable; Git tag and fork comparison still runs.'
+            echo 'RELEASE_OK=false' >> "$GITHUB_ENV"
+            rm -f "$archive"
+          fi
+
+      - name: Compare all patch-touched files and test both patch formats
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYCOMPARE'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          root = Path.cwd()
+          out = root / 'comparison'
+          original_patch = root / os.environ['PATCH_FILE']
+          text = original_patch.read_text(encoding='utf-8')
+          names = list(dict.fromkeys(re.findall(r'^--- a/(.+)$', text, re.M)))
+          expected_git_names = [n for n in names if n != 'configure']
+          if 'configure' not in names or 'configure.in' not in names:
+              raise SystemExit('Patch does not contain both configure and configure.in; refusing to strip blindly.')
+          if not expected_git_names or len(names) < 10:
+              raise SystemExit('Unexpected patch structure; refusing to analyze a truncated patch.')
+          # Strip only the one generated configure hunk; all other patch text is untouched.
+          stripped = []
+          skip = False
+          for line in text.splitlines(keepends=True):
+              if line.startswith('--- a/'):
+                  skip = (line.rstrip('\r\n') == '--- a/configure')
+              if not skip:
+                  stripped.append(line)
+          git_patch = out / 'patch-for-git-no-generated-configure.patch'
+          git_patch.write_text(''.join(stripped), encoding='utf-8')
+          git_paths = re.findall(r'^--- a/(.+)$', git_patch.read_text(), re.M)
+          if git_paths != expected_git_names:
+              raise SystemExit('Stripped patch unexpectedly removed unrelated hunks; aborted.')
+
+          upstream = out / 'upstream-git'
+          release = out / 'release' / 'php-5.6.40'
+          release_available = os.environ.get('RELEASE_OK') == 'true'
+          table = []
+          detail = []
+
+          def compare(path_a, path_b):
+              if not path_a.is_file() and not path_b.is_file():
+                  return 'both absent'
+              if not path_a.is_file():
+                  return 'missing in first'
+              if not path_b.is_file():
+                  return 'missing in second'
+              return ('SAME' if hashlib.sha256(path_a.read_bytes()).digest() ==
+                      hashlib.sha256(path_b.read_bytes()).digest() else 'DIFFERENT')
+
+          for name in names:
+              fork_git = compare(upstream / name, root / name)
+              tag_rel = compare(upstream / name, release / name) if release_available else 'NOT CHECKED'
+              fork_rel = compare(root / name, release / name) if release_available else 'NOT CHECKED'
+              table.append((name, fork_git, tag_rel, fork_rel))
+              if name != 'configure' and fork_git != 'SAME':
+                  detail.append(name)
+          (out / 'patch-file-differences.txt').write_text('\n'.join(detail) + '\n')
+
+          def check_patch(directory, patch_path, reverse=False):
+              args = ['git', 'apply', '--check']
+              if reverse:
+                  args.append('--reverse')
+              args.append(str(patch_path))
+              run = subprocess.run(args, cwd=directory, text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+              return {'ok': run.returncode == 0, 'log': run.stdout[-12000:]}
+
+          checks = {
+              'official_git_forward_without_configure': check_patch(upstream, git_patch),
+              'fork_forward_without_configure': check_patch(root, git_patch),
+              'fork_reverse_without_configure': check_patch(root, git_patch, reverse=True),
+          }
+          if release_available:
+              checks['official_release_full_patch'] = check_patch(release, original_patch)
+
+          status = 'NEEDS_REVIEW'
+          fork_forward = checks['fork_forward_without_configure']['ok']
+          fork_reverse = checks['fork_reverse_without_configure']['ok']
+          official_forward = checks['official_git_forward_without_configure']['ok']
+          rel_forward = checks.get('official_release_full_patch', {}).get('ok')
+          if fork_forward and official_forward and (rel_forward or not release_available):
+              status = 'GIT_AND_RELEASE_COMPATIBLE' if rel_forward else 'GIT_COMPATIBLE_RELEASE_UNCHECKED'
+          elif fork_reverse and official_forward:
+              status = 'FORK_ALREADY_PATCHED'
+          elif not official_forward:
+              status = 'PATCH_NOT_COMPATIBLE_WITH_OFFICIAL_GIT'
+          elif not fork_forward and not fork_reverse:
+              status = 'FORK_SOURCE_MISMATCH'
+          elif rel_forward is False:
+              status = 'RELEASE_PATCH_MISMATCH'
+
+          raw = {
+              'verdict': status, 'fork_commit': os.environ.get('FORK_SHA'),
+              'official_git_tag_commit': os.environ.get('OFFICIAL_SHA'),
+              'release_archive_verified': release_available, 'file_comparisons': [
+                  {'file': a, 'fork_vs_tag': b, 'tag_vs_release': c, 'fork_vs_release': d}
+                  for a, b, c, d in table],
+              'patch_checks': checks,
+          }
+          (out / 'results.json').write_text(json.dumps(raw, indent=2, ensure_ascii=False) + '\n')
+
+          lines = [
+              '# PHP 5.6.40 三方源码对比（自动生成）',
+              '',
+              f'**结论代码：`{status}`**',
+              '',
+              f'- Fork 当前提交：`{os.environ.get("FORK_SHA", "unknown")}`',
+              f'- PHP 官方 Git 标签提交：`{os.environ.get("OFFICIAL_SHA", "unknown")}`',
+              f'- 官方发行压缩包 SHA256：`{os.environ.get("RELEASE_SHA256")}`',
+              f'- 已校验并解压发行包：**{release_available}**',
+              '',
+              '## 逐文件字节比较（补丁实际涉及的文件）', '',
+              '| 文件 | Fork vs 官方 Git | 官方 Git vs 发布包 | Fork vs 发布包 |',
+              '|---|---|---|---|',
+          ]
+          for name, b, c, d in table:
+              lines.append(f'| `{name}` | {b} | {c} | {d} |')
+          lines += ['', '## 补丁严格应用测试', '',
+                    '| 测试 | 结果 |', '|---|---|']
+          for name, result in checks.items():
+              lines.append(f'| `{name}` | {"PASS" if result["ok"] else "FAIL"} |')
+          lines += ['', '## 解释', '']
+          if status == 'GIT_AND_RELEASE_COMPATIBLE':
+              lines.append('**两条源码基线都能使用当前补丁**：发布包直接用完整补丁；Git 工作树只去掉生成文件 configure 的那一个差异块，然后按 Git 旧版要求执行 buildconf。')
+          elif status == 'FORK_ALREADY_PATCHED':
+              lines.append('Fork 的源代码已经能完整反向应用去除 configure 的补丁，**请勿重复打补丁**。可继续检查生成 configure 和编译。')
+          elif status == 'FORK_SOURCE_MISMATCH':
+              lines.append('即使只去掉 configure，当前 fork 仍无法严格应用补丁；**不能自动强制打补丁**。请看不同文件列表与 patch 检查错误，确认 fork 基线或是否只部分补丁。')
+          elif status == 'PATCH_NOT_COMPATIBLE_WITH_OFFICIAL_GIT':
+              lines.append('原补丁去掉 configure 后在 PHP 官方 Git tag 上也失败。必须先修补丁，不应对 fork 使用。')
+          elif status == 'RELEASE_PATCH_MISMATCH':
+              lines.append('Git 工作树可用，但完整补丁对校验过的官方发布包未能严格应用，不能宣称两者通用。')
+          else:
+              lines.append('需要查看详细文件差异和失败日志。不要用 --force 或 --reject 跳过冲突。')
+          lines += ['', '## 排错日志（前 4000 字符）', '']
+          for name, result in checks.items():
+              if not result['ok']:
+                  lines += [f'### `{name}`', '```text', result['log'][:4000], '```']
+          report = '\n'.join(lines) + '\n'
+          (out / 'report.md').write_text(report, encoding='utf-8')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write(report)
+          print(report[:16000])
+          PYCOMPARE
+
+      - name: Upload comparison report and Git-compatible patch
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: php56-three-way-source-comparison
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            comparison/report.md
+            comparison/results.json
+            comparison/all-tree-differences.txt
+            comparison/patch-file-differences.txt
+            comparison/patch-for-git-no-generated-configure.patch
