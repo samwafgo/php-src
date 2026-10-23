@@ -1,67 +1,3 @@
-name: build-linux-php56-from-fork
-
-on:
-  workflow_call:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  build:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 90
-    env:
-      TARGET_BRANCH: PHP-5.6-CVE-2026-109618-109619
-    steps:
-      - name: Checkout the fork branch source (no release archive download)
-        uses: actions/checkout@v4
-        with:
-          ref: PHP-5.6-CVE-2026-109618-109619
-          persist-credentials: false
-
-      - name: Verify patched Git source before compiling
-        shell: bash
-        run: |
-          set -euo pipefail
-          grep -Fq '#define PHP_VERSION "5.6.40-sec1"' main/php_version.h
-          grep -Fq 'zend_mm_safe_error_ex' Zend/zend_alloc.c
-          test -f configure.in
-          test -f buildconf
-          python3 ci/prepare-git-patch.py \
-            --source security-backports/php-5.6.40-CVE-2026-109618-109619.patch \
-            --output "$RUNNER_TEMP/php56-git.patch"
-          git apply --reverse --check "$RUNNER_TEMP/php56-git.patch"
-          echo '[OK] Complete Git patch present on checkout'
-
-      - name: Generate configure and build on a legacy-toolchain-compatible environment
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          # IMPORTANT: -i keeps STDIN open so bash -se can read the heredoc below.
-          docker run --rm -i \
-            -v "$GITHUB_WORKSPACE:/work" -w /work \
-            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-            ubuntu:20.04 bash -se <<'IN_CONTAINER'
-          set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          trap 'chown -R "${HOST_UID}:${HOST_GID}" /work/artifacts 2>/dev/null || true' EXIT
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            autoconf automake libtool build-essential bison re2c \
-            pkg-config perl ca-certificates
-          autoconf --version | head -1
-          ./buildconf --force
-          test -x ./configure
-          ./configure --prefix=/opt/php56-sec1 --disable-all \
-             --enable-cli --enable-cgi --enable-fpm --enable-session \
-             --enable-debug --without-pear
-          make -j2
-          ./sapi/cli/php -v | tee artifacts/version.txt
-          grep -Fq 'PHP 5.6.40-sec1' artifacts/version.txt
-          ./sapi/cli/php -i | grep -F max_multipart_body_parts | tee artifacts/multipart-ini.txt
-          mkdir -p artifacts/php56-git-ubuntu2004/{bin,sbin}
           cp sapi/cli/php artifacts/php56-git-ubuntu2004/bin/
           cp sapi/cgi/php-cgi artifacts/php56-git-ubuntu2004/bin/
           cp sapi/fpm/php-fpm artifacts/php56-git-ubuntu2004/sbin/
@@ -80,9 +16,20 @@ jobs:
               exit 1
             fi
           done
-          tar -tzf artifacts/php56-git-ubuntu2004-unofficial.tar.gz | grep -Fxq 'php56-git-ubuntu2004/bin/php'
-          tar -tzf artifacts/php56-git-ubuntu2004-unofficial.tar.gz | grep -Fxq 'php56-git-ubuntu2004/bin/php-cgi'
-          tar -tzf artifacts/php56-git-ubuntu2004-unofficial.tar.gz | grep -Fxq 'php56-git-ubuntu2004/sbin/php-fpm'
+          # Verify the whole tar archive before searching for individual paths.
+          # DO NOT pipe tar to grep -q under pipefail: grep exits early and can
+          # make tar report "stdout: write error" even for a healthy archive.
+          archive_list="$RUNNER_TEMP/php56-git-ubuntu2004-archive-list.txt"
+          tar -tzf artifacts/php56-git-ubuntu2004-unofficial.tar.gz > "$archive_list"
+          for expected_entry in \
+            php56-git-ubuntu2004/bin/php \
+            php56-git-ubuntu2004/bin/php-cgi \
+            php56-git-ubuntu2004/sbin/php-fpm; do
+            if ! grep -Fxq -- "$expected_entry" "$archive_list"; then
+              echo "::error::Missing binary in tar archive: $expected_entry"
+              exit 1
+            fi
+          done
           sha256sum -c artifacts/binaries.sha256
           echo '[OK] Actual PHP binaries were built and packaged.'
 
@@ -94,3 +41,67 @@ jobs:
             artifacts/php56-git-ubuntu2004-unofficial.tar.gz
             artifacts/binaries.sha256
             artifacts/version.txt
+            artifacts/multipart-ini.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Run limited regression tests, capture actual failures
+        shell: bash
+        run: |
+          set -euo pipefail
+          # IMPORTANT: -i keeps STDIN open so bash -se can read the heredoc below.
+          docker run --rm -i \
+            -v "$GITHUB_WORKSPACE:/work" -w /work \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            ubuntu:20.04 bash -se <<'IN_CONTAINER'
+          set -euo pipefail
+          trap 'chown -R "${HOST_UID}:${HOST_GID}" /work/artifacts 2>/dev/null || true' EXIT
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends python3
+          export NO_INTERACTION=1 SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1
+          export TEST_PHP_EXECUTABLE=/work/sapi/cli/php
+          export TEST_PHP_CGI_EXECUTABLE=/work/sapi/cgi/php-cgi
+          # Ensure fatal parser problems are not hidden. Recompile already completed in the earlier stage.
+          set +e
+          ./sapi/cli/php run-tests.php Zend/tests ext/session/tests tests/basic > artifacts/tests.log 2>&1
+          test_exit=$?
+          set -e
+          printf '%s\n' "$test_exit" > artifacts/test-exit-code.txt
+          export TEST_EXIT_CODE="$test_exit"
+          python3 - <<'PYTEST'
+          from pathlib import Path
+          import re
+          p = Path('artifacts/tests.log')
+          log = p.read_text(errors='replace') if p.exists() else ''
+          if 'TEST RESULT SUMMARY' not in log:
+              raise SystemExit('PHPT runner did not complete; check artifacts/tests.log')
+          # PHP 5.x prints paths in [brackets] in its FAILED TEST SUMMARY.
+          tail = log.rsplit('FAILED TEST SUMMARY', 1)[-1] if 'FAILED TEST SUMMARY' in log else ''
+          tail = tail.split('\n' + '=' * 10, 1)[0]
+          actual = sorted(set(re.findall(r'\[((?:Zend|ext|tests)/[^]\r\n]+\.phpt)\]', tail)))
+          expected = sorted({x.strip().strip('[]') for x in
+                             Path('tests/expected-failures.txt').read_text().splitlines() if x.strip()})
+          extra = sorted(set(actual) - set(expected))
+          Path('artifacts/actual-failures.txt').write_text('\n'.join(actual) + '\n')
+          Path('artifacts/unexpected-failures.txt').write_text('\n'.join(extra) + '\n')
+          print('Actual failures:', actual)
+          print('Unexpected failures:', extra)
+          if extra:
+              raise SystemExit('Unexpected PHP test failures found')
+          if int(__import__('os').environ['TEST_EXIT_CODE']) != 0 and not actual:
+              raise SystemExit('Test runner exited nonzero with no recognized expected failures')
+          PYTEST
+          IN_CONTAINER
+
+      - name: Upload test logs even after failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: php56-git-linux-test-evidence
+          path: |
+            artifacts/tests.log
+            artifacts/test-exit-code.txt
+            artifacts/actual-failures.txt
+            artifacts/unexpected-failures.txt
+          if-no-files-found: ignore
