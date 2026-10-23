@@ -166,21 +166,41 @@ jobs:
           out = Path('artifacts')
           p = out / 'tests.log'
           log = p.read_text(errors='replace') if p.exists() else ''
-          if 'TEST RESULT SUMMARY' not in log:
-              print('::error::PHPT did not reach its summary. See tests.log and first/last lines above.')
-              raise SystemExit(1)
-          if not re.search(r'^Number of tests\s*:', log, re.M):
-              print('::error::PHPT summary did not provide a test count.')
-              raise SystemExit(1)
+          # PHP 5.6 run-tests.php does NOT print "TEST RESULT SUMMARY".
+          # A complete run ends with "Number of tests :" and category counts.
+          def count(label):
+              match = re.search(r'^' + re.escape(label) + r'\s*:\s*(\d+)\b', log, re.M)
+              if not match:
+                  raise SystemExit('::error::Missing PHPT counter: ' + label)
+              return int(match.group(1))
 
-          # PHP 5.6 writes failures at the very end, under FAILED TEST SUMMARY.
+          total = count('Number of tests')
+          passed = count('Tests passed')
+          skipped = count('Tests skipped')
+          failed = count('Tests failed')
+          xfailed = count('Expected fail')
+          warned = count('Tests warned')
+          if total == 0:
+              raise SystemExit('::error::PHPT reported zero tests')
+          if passed + skipped + failed + xfailed + warned != total:
+              raise SystemExit('::error::Inconsistent PHPT counters: ' + str(
+                  dict(total=total, passed=passed, skipped=skipped, failed=failed,
+                       xfailed=xfailed, warned=warned)))
+
+          # Anchor section titles: EXPECTED FAILED TEST SUMMARY is XFAIL,
+          # not the list of actual failures.
           match = re.search(r'(?ms)^FAILED TEST SUMMARY\s*\n[-]+\n(.*?)(?=^={10,}|\Z)', log)
           section = match.group(1) if match else ''
           actual = sorted(set(re.findall(r'\[((?:Zend|ext|tests)/[^]\r\n]+\.phpt)\]', section)))
+          if len(actual) != failed:
+              raise SystemExit('::error::PHPT failed count (%d) does not match parsed failures (%d)' %
+                               (failed, len(actual)))
+
           expected_path = Path('tests/expected-failures.txt')
           if not expected_path.exists():
-              raise SystemExit('Missing expected-failures file: ' + str(expected_path))
-          expected = {x.strip().strip('[]') for x in expected_path.read_text().splitlines() if x.strip()}
+              raise SystemExit('::error::Missing expected-failures file: ' + str(expected_path))
+          expected = {x.strip().strip('[]') for x in expected_path.read_text().splitlines()
+                      if x.strip() and not x.lstrip().startswith('#')}
           extra = sorted(set(actual) - expected)
           now_passing = sorted(expected - set(actual))
           (out / 'actual-failures.txt').write_text('\n'.join(actual) + ('\n' if actual else ''))
@@ -188,19 +208,61 @@ jobs:
           (out / 'expected-now-passing.txt').write_text('\n'.join(now_passing) + ('\n' if now_passing else ''))
           exit_code_path = out / 'test-exit-code.txt'
           test_exit = int(exit_code_path.read_text().strip()) if exit_code_path.exists() else -1
-          print('PHPT runner exit code:', test_exit)
-          print('Known failures:', actual)
+          print('PHPT results: total=%d passed=%d skipped=%d failed=%d xfail=%d warned=%d exit=%d' %
+                (total, passed, skipped, failed, xfailed, warned, test_exit))
+          print('Known actual failures:', actual)
           print('New/unexpected failures:', extra)
-          print('Expected but now passing:', now_passing)
+          print('Previously known but now passing:', now_passing)
           for heading in ('BORKED TEST SUMMARY', 'LEAKED TEST SUMMARY'):
               if re.search(r'^' + re.escape(heading) + r'$', log, re.M):
                   raise SystemExit('::error::' + heading + ' present; inspect tests.log')
+          if warned:
+              raise SystemExit('::error::PHPT reported warning results; review tests.log')
           if extra:
-              raise SystemExit('::error::Unexpected PHP test failures')
+              raise SystemExit('::error::Unexpected PHP test failures; inspect saved diffs')
           if test_exit != 0 and not actual:
-              raise SystemExit('::error::PHPT runner exited nonzero without recognized failures')
-          print('PHPT analysis completed without unrecognized test failures.')
+              raise SystemExit('::error::PHPT process exited nonzero without documented failed tests')
+          if failed:
+              print('::warning::%d allowlisted PHPT failures remain, all in session upload/RFC1867 tests. '
+                    'These are real failures (not XFAIL); do not treat this as CVE remediation verification.' % failed)
+          print('PHPT completed and all *actual* failures are currently allowlisted.')
+
+          import os
+          summary_path = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary_path:
+              with open(summary_path, 'a', encoding='utf-8') as summary:
+                  summary.write('\n### PHP 5.6.40-sec1 PHPT limited regression\n\n')
+                  summary.write('| Total | PASS | SKIP | FAIL (allowlisted) | XFAIL | WARN |\n')
+                  summary.write('|---:|---:|---:|---:|---:|---:|\n')
+                  summary.write('| %d | %d | %d | %d | %d | %d |\n\n' %
+                                (total, passed, skipped, failed, xfailed, warned))
+                  summary.write('**Warning:** FAIL entries are actual failures in session/RFC1867 upload tests, '
+                                'not the separate XFAIL entries. This does not prove the CVEs are fixed.\n')
           PYTEST
+
+      - name: Collect PHPT .diff, .out and .exp evidence
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PYDIFF'
+          from pathlib import Path
+          import shutil
+          source_root = Path.cwd()
+          destination = Path('artifacts/phpt-failure-details')
+          copied = 0
+          for area in ('Zend/tests', 'ext/session/tests', 'tests/basic'):
+              for diff in Path(area).rglob('*.diff'):
+                  base = diff.with_suffix('')
+                  for ext in ('.diff', '.out', '.exp', '.log'):
+                      source = base.with_suffix(ext)
+                      if not source.is_file():
+                          continue
+                      target = destination / source
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copyfile(source, target)
+                      copied += 1
+          print('Copied %d PHPT debug files to %s' % (copied, destination))
+          PYDIFF
 
       - name: Upload test logs even after failure
         if: always()
@@ -214,4 +276,5 @@ jobs:
             artifacts/actual-failures.txt
             artifacts/unexpected-failures.txt
             artifacts/expected-now-passing.txt
+            artifacts/phpt-failure-details/**
           if-no-files-found: ignore
