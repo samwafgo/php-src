@@ -1,3 +1,67 @@
+name: build-linux-php56-from-fork
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      TARGET_BRANCH: PHP-5.6-CVE-2026-109618-109619
+    steps:
+      - name: Checkout the fork branch source (no release archive download)
+        uses: actions/checkout@v4
+        with:
+          ref: PHP-5.6-CVE-2026-109618-109619
+          persist-credentials: false
+
+      - name: Verify patched Git source before compiling
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq '#define PHP_VERSION "5.6.40-sec1"' main/php_version.h
+          grep -Fq 'zend_mm_safe_error_ex' Zend/zend_alloc.c
+          test -f configure.in
+          test -f buildconf
+          python3 ci/prepare-git-patch.py \
+            --source security-backports/php-5.6.40-CVE-2026-109618-109619.patch \
+            --output "$RUNNER_TEMP/php56-git.patch"
+          git apply --reverse --check "$RUNNER_TEMP/php56-git.patch"
+          echo '[OK] Complete Git patch present on checkout'
+
+      - name: Generate configure and build on a legacy-toolchain-compatible environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          # IMPORTANT: -i keeps STDIN open so bash -se can read the heredoc below.
+          docker run --rm -i \
+            -v "$GITHUB_WORKSPACE:/work" -w /work \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            ubuntu:20.04 bash -se <<'IN_CONTAINER'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          trap 'chown -R "${HOST_UID}:${HOST_GID}" /work/artifacts 2>/dev/null || true' EXIT
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            autoconf automake libtool build-essential bison re2c \
+            pkg-config perl ca-certificates
+          autoconf --version | sed -n '1p'
+          ./buildconf --force
+          test -x ./configure
+          ./configure --prefix=/opt/php56-sec1 --disable-all \
+             --enable-cli --enable-cgi --enable-fpm --enable-session \
+             --enable-debug --without-pear
+          make -j2
+          ./sapi/cli/php -v | tee artifacts/version.txt
+          grep -Fq 'PHP 5.6.40-sec1' artifacts/version.txt
+          ./sapi/cli/php -i | grep -F max_multipart_body_parts | tee artifacts/multipart-ini.txt
+          mkdir -p artifacts/php56-git-ubuntu2004/{bin,sbin}
           cp sapi/cli/php artifacts/php56-git-ubuntu2004/bin/
           cp sapi/cgi/php-cgi artifacts/php56-git-ubuntu2004/bin/
           cp sapi/fpm/php-fpm artifacts/php56-git-ubuntu2004/sbin/
