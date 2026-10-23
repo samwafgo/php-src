@@ -822,6 +822,11 @@ upload_max_filesize = 2M
 ; Maximum number of files that can be uploaded via a single request
 max_file_uploads = 20
 
+; Maximum number of multipart body parts in a single POST request.
+; -1 means the default limit: max_input_vars + max_file_uploads.
+; (GHSA-6wmf-4rv5-p3rp / CVE-2026-109619 hardening)
+max_multipart_body_parts = -1
+
 ;;;;;;;;;;;;;;;;;;
 ; Fopen wrappers ;
 ;;;;;;;;;;;;;;;;;;

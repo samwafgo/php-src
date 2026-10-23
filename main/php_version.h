@@ -3,6 +3,6 @@
 #define PHP_MAJOR_VERSION 5
 #define PHP_MINOR_VERSION 6
 #define PHP_RELEASE_VERSION 40
-#define PHP_EXTRA_VERSION ""
-#define PHP_VERSION "5.6.40"
+#define PHP_EXTRA_VERSION "-sec1"
+#define PHP_VERSION "5.6.40-sec1"
 #define PHP_VERSION_ID 50640

@@ -116,6 +116,10 @@ ZEND_API void zend_llist_destroy(zend_llist *l)
 	}
 
 	l->count = 0;
+	/* GHSA-6wmf-4rv5-p3rp (CVE-2026-109619): leave no stale pointers
+	 * behind; a destroyed list must look empty if it is touched again. */
+	l->head  = NULL;
+	l->tail  = NULL;
 }
 
 

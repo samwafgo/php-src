@@ -330,6 +330,18 @@ void shutdown_executor(TSRMLS_D) /* {{{ */
 
 	zend_shutdown_fpu(TSRMLS_C);
 
+	/* GHSA-6wmf-4rv5-p3rp (CVE-2026-109619) backport from PHP-7.4
+	 * security branch: these globals may be accessed before
+	 * init_executor() of the next request (e.g. by error handling
+	 * triggered in between). Leave no stale state behind. */
+	EG(error_handling) = EH_NORMAL;
+	EG(exception) = NULL;
+	memset(&EG(user_error_handlers_error_reporting), 0, sizeof(EG(user_error_handlers_error_reporting)));
+	memset(&EG(user_error_handlers), 0, sizeof(EG(user_error_handlers)));
+	memset(&EG(user_exception_handlers), 0, sizeof(EG(user_exception_handlers)));
+	EG(objects_store).object_buckets = NULL;
+	EG(objects_store).top = 1;
+
 	EG(active) = 0;
 }
 /* }}} */

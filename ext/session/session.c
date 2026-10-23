@@ -2669,7 +2669,11 @@ static int php_session_rfc1867_callback(unsigned int event, void *event_data, vo
 	if (php_session_rfc1867_orig_callback) {
 		retval = php_session_rfc1867_orig_callback(event, event_data, extra TSRMLS_CC);
 	}
-	if (!PS(rfc1867_enabled)) {
+	/* GHSA-6wmf-4rv5-p3rp (CVE-2026-109619) backport: unconditionally
+	 * disable the rfc1867 upload-progress session write path. This code
+	 * runs during SAPI startup, before normal request initialization,
+	 * and pollutes global session state across requests. */
+	if (!PS(rfc1867_enabled) || 1) {
 		return retval;
 	}
 
