@@ -1,0 +1,56 @@
+# Windows 构建草案 —— 首次使用前请在一台 Windows 机器上实测调整
+#
+# 背景:PHP 5.6 官方 Windows 二进制用 VC11(VS2012)构建,发布
+# x86/x64 × TS(ZTS,mod_php 用)/ NTS(IIS/NGINX 用)共 4 包。
+# windows-2019 runner 自带 VS2019(v142),VC11 已不可装;
+# 社区通行做法是用新 MSVC 编译并绕过 win32/build/confutils.js 的版本检查。
+name: build-windows
+
+on:
+  workflow_dispatch:   # 默认手动触发,验证可靠后再改为 push 触发
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86]
+        ts: [nts, ts]        # ts = ZTS(--with-zts), nts = 非线程安全
+    runs-on: windows-2019
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup php-sdk-binary-tools
+        shell: cmd
+        run: |
+          git clone -b php-sdk-2.1 https://github.com/php/php-sdk-binary-tools.git C:\php-sdk
+          :: 老分支才认识 5.6 的 buildconf/configure 流程
+
+      - name: Patch sources
+        shell: cmd
+        run: |
+          C:\php-sdk\bin\patch.exe -p1 < patches\php-5.6.40-CVE-2026-109618-109619.patch
+
+      - name: Buildconf + Configure + Build (${{ matrix.arch }} ${{ matrix.ts }})
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Microsoft Visual Studio\2019\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.arch == 'x64' && 'amd64' || 'x86' }}
+          buildconf
+          set ZTS_OPT=
+          if "${{ matrix.ts }}"=="ts" set ZTS_OPT=--with-zts
+          configure --disable-all --enable-cli --enable-cgi --enable-session %ZTS_OPT%
+          nmake
+
+      - name: nmake test
+        shell: cmd
+        run: nmake test TESTS="Zend\tests ext\session\tests tests\basic"
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-5.6.40-sec1-${{ matrix.ts }}-Win32-${{ matrix.arch }}
+          path: |
+            ${{ matrix.arch == 'x64' && 'x64\\' || '' }}Release*_TS\\php.exe
+            ${{ matrix.arch == 'x64' && 'x64\\' || '' }}Release*_TS\\php-cgi.exe
+            Release*\\php.exe
+            Release*\\php-cgi.exe
