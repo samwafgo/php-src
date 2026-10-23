@@ -7,58 +7,79 @@ permissions:
   contents: write
 
 concurrency:
-  group: php56-security-patch
+  group: php56-backport-patch
   cancel-in-progress: false
 
 jobs:
   apply:
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     env:
       TARGET_BRANCH: PHP-5.6-CVE-2026-109618-109619
-      PATCH_FILE: security-backports/php-5.6.40-CVE-2026-109618-109619.patch
+      ORIGINAL_PATCH: security-backports/php-5.6.40-CVE-2026-109618-109619.patch
     steps:
-      - name: Check out the target PHP 5.6 branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: PHP-5.6-CVE-2026-109618-109619
-          fetch-depth: 1
           persist-credentials: true
+          fetch-depth: 1
 
-      - name: Check prerequisites and working tree
+      - name: Validate baseline and generate Git-compatible patch
         shell: bash
         run: |
           set -euo pipefail
-          test -f "$PATCH_FILE"
+          test -s "$ORIGINAL_PATCH"
           test -f Zend/zend_alloc.c
           test -f main/php_version.h
-          git diff --exit-code
-          git diff --cached --exit-code
-          grep -q '#define PHP_VERSION "5.6.40"' main/php_version.h ||             grep -q '#define PHP_VERSION "5.6.40-sec1"' main/php_version.h
+          grep -Eq '#define PHP_VERSION "5\.6\.40(-sec1)?"' main/php_version.h
+          # Ensure there is no unrelated/stale edit in the checkout.
+          git diff --quiet
+          git diff --cached --quiet
+          python3 ci/prepare-git-patch.py \
+            --source "$ORIGINAL_PATCH" --output "$RUNNER_TEMP/php56-git.patch"
+          git apply --stat "$RUNNER_TEMP/php56-git.patch"
 
-      - name: Apply complete patch or recognize an already-applied patch
-        id: patch
+      - name: Apply complete patch once, or verify it is already applied
+        id: apply
         shell: bash
         run: |
           set -euo pipefail
-          if git apply --reverse --check "$PATCH_FILE"; then
-            echo 'Full patch already applied; no changes required.'
-            echo 'applied=false' >> "$GITHUB_OUTPUT"
+          if git apply --reverse --check "$RUNNER_TEMP/php56-git.patch" >/dev/null 2>&1; then
+            echo 'Full Git patch is already applied; no new commit.'
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
           else
-            git apply --check "$PATCH_FILE"
-            git apply "$PATCH_FILE"
+            git apply --check "$RUNNER_TEMP/php56-git.patch"
+            git apply "$RUNNER_TEMP/php56-git.patch"
+            git apply --reverse --check "$RUNNER_TEMP/php56-git.patch"
             git diff --check
-            echo 'applied=true' >> "$GITHUB_OUTPUT"
+            grep -Fq '#define PHP_VERSION "5.6.40-sec1"' main/php_version.h
+            grep -Fq 'zend_mm_safe_error_ex' Zend/zend_alloc.c
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Commit and push patch
-        if: steps.patch.outputs.applied == 'true'
+      - name: Commit source changes and push to the fork branch
+        if: steps.apply.outputs.changed == 'true'
         shell: bash
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -u
+          # Do not stage CI files, binaries, or generated configure.
+          python3 - "$ORIGINAL_PATCH" <<'PY'
+          import re, subprocess, sys
+          src = open(sys.argv[1], encoding='utf-8').read()
+          names = [name for name in re.findall(r'^--- a/(.+)$', src, re.M) if name != 'configure']
+          subprocess.run(['git', 'add', '--', *names], check=True)
+          PY
           git diff --cached --check
           git diff --cached --quiet && { echo 'Nothing to commit'; exit 0; }
-          git commit -m 'Backport PHP 5.6 CVE-2026-109618/109619 changes'
+          git commit -m 'Backport PHP 5.6.40 security changes (unofficial)'
           git push origin "HEAD:${TARGET_BRANCH}"
+
+  # One-click chaining: even a GITHUB_TOKEN commit does not fire a normal push workflow.
+  # Call the reusable Linux build explicitly after applying/confirming the patch.
+  build-linux:
+    needs: apply
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build.yml

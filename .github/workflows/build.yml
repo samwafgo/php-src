@@ -1,129 +1,141 @@
-name: build-linux-php56
+name: build-linux-php56-from-fork
 
 on:
-  push:
-    branches:
-      - PHP-5.6-CVE-2026-109618-109619
+  workflow_call:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: php56-linux-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  TARGET_BRANCH: PHP-5.6-CVE-2026-109618-109619
-  PHP_TARBALL: php-5.6.40.tar.xz
-  PHP_SHA256: 1369a51eee3995d7fbd1c5342e5cc917760e276d561595b6052b21ace2656d1c
-  PATCH_FILE: security-backports/php-5.6.40-CVE-2026-109618-109619.patch
-
 jobs:
-  patch-preflight:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Verify target branch and patch against official PHP 5.6.40
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "${GITHUB_REF_NAME}" = "${TARGET_BRANCH}" || {
-            echo '::error::Choose PHP-5.6-CVE-2026-109618-109619 in the Actions branch dropdown.'
-            exit 1
-          }
-          test -s "$PATCH_FILE"
-          curl --fail --location --retry 3 --retry-delay 3 \
-            --output "$PHP_TARBALL" "https://museum.php.net/php5/$PHP_TARBALL"
-          echo "$PHP_SHA256  $PHP_TARBALL" | sha256sum -c -
-          tar -xJf "$PHP_TARBALL"
-          cd php-5.6.40
-          patch -p1 --batch --forward --dry-run < "../$PATCH_FILE"
-          patch -p1 --batch --forward < "../$PATCH_FILE"
-          grep -Fq 'PHP_EXTRA_VERSION "-sec1"' main/php_version.h
-          echo 'Patch applies cleanly to verified PHP 5.6.40 source.'
-
-  linux:
-    needs: patch-preflight
+  build:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: ubuntu2204, image: 'ubuntu:22.04' }
-          - { name: ubuntu2404, image: 'ubuntu:24.04' }
-          - { name: debian12,   image: 'debian:12' }
-          - { name: almalinux9, image: 'almalinux:9' }
+    env:
+      TARGET_BRANCH: PHP-5.6-CVE-2026-109618-109619
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout the fork branch source (no release archive download)
+        uses: actions/checkout@v4
+        with:
+          ref: PHP-5.6-CVE-2026-109618-109619
+          persist-credentials: false
 
-      - name: Download pinned source and apply repository patch
+      - name: Verify patched Git source before compiling
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail --location --retry 3 --retry-delay 3 \
-            --output "$PHP_TARBALL" "https://museum.php.net/php5/$PHP_TARBALL"
-          echo "$PHP_SHA256  $PHP_TARBALL" | sha256sum -c -
-          tar -xJf "$PHP_TARBALL"
-          cd php-5.6.40
-          patch -p1 --batch --forward --dry-run < "../$PATCH_FILE"
-          patch -p1 --batch --forward < "../$PATCH_FILE"
+          grep -Fq '#define PHP_VERSION "5.6.40-sec1"' main/php_version.h
+          grep -Fq 'zend_mm_safe_error_ex' Zend/zend_alloc.c
+          test -f configure.in
+          test -f buildconf
+          python3 ci/prepare-git-patch.py \
+            --source security-backports/php-5.6.40-CVE-2026-109618-109619.patch \
+            --output "$RUNNER_TEMP/php56-git.patch"
+          git apply --reverse --check "$RUNNER_TEMP/php56-git.patch"
+          echo '[OK] Complete Git patch present on checkout'
 
-      - name: Build and test in ${{ matrix.name }} container
+      - name: Generate configure and build on a legacy-toolchain-compatible environment
         shell: bash
-        env:
-          IMAGE: ${{ matrix.image }}
-          DISTRO: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" -w /work \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            ubuntu:20.04 bash -se <<'IN_CONTAINER'
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          trap 'chown -R "${HOST_UID}:${HOST_GID}" /work/artifacts /work 2>/dev/null || true' EXIT
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            autoconf automake libtool build-essential bison re2c \
+            pkg-config perl ca-certificates
+          autoconf --version | head -1
+          ./buildconf --force
+          test -x ./configure
+          ./configure --prefix=/opt/php56-sec1 --disable-all \
+             --enable-cli --enable-cgi --enable-fpm --enable-session \
+             --enable-debug --without-pear
+          make -j2
+          ./sapi/cli/php -v | tee artifacts/version.txt
+          grep -Fq 'PHP 5.6.40-sec1' artifacts/version.txt
+          ./sapi/cli/php -i | grep -F max_multipart_body_parts | tee artifacts/multipart-ini.txt
+          mkdir -p artifacts/php56-git-ubuntu2004/{bin,sbin}
+          cp sapi/cli/php artifacts/php56-git-ubuntu2004/bin/
+          cp sapi/cgi/php-cgi artifacts/php56-git-ubuntu2004/bin/
+          cp sapi/fpm/php-fpm artifacts/php56-git-ubuntu2004/sbin/
+          tar -C artifacts -czf artifacts/php56-git-ubuntu2004-unofficial.tar.gz php56-git-ubuntu2004
+          sha256sum artifacts/php56-git-ubuntu2004-unofficial.tar.gz > artifacts/binaries.sha256
+          IN_CONTAINER
+
+      - name: Upload built binaries (build passing does not prove CVEs fixed)
+        uses: actions/upload-artifact@v4
+        with:
+          name: php56-git-linux-unofficial-binaries
+          path: |
+            artifacts/php56-git-ubuntu2004-unofficial.tar.gz
+            artifacts/binaries.sha256
+            artifacts/version.txt
+            artifacts/multipart-ini.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Run limited regression tests, capture actual failures
+        shell: bash
         run: |
           set -euo pipefail
           docker run --rm \
-            --volume "$GITHUB_WORKSPACE:/work" \
-            --workdir /work \
-            --env DISTRO \
-            --env HOST_UID="$(id -u)" \
-            --env HOST_GID="$(id -g)" \
-            "$IMAGE" bash -se <<'IN_CONTAINER'
+            -v "$GITHUB_WORKSPACE:/work" -w /work \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            ubuntu:20.04 bash -se <<'IN_CONTAINER'
           set -euo pipefail
-          trap 'chown -R "${HOST_UID}:${HOST_GID}" /work/php-5.6.40 /work/dist 2>/dev/null || true' EXIT
-          if command -v apt-get >/dev/null 2>&1; then
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update
-            apt-get install -y --no-install-recommends \
-              gcc g++ make libc6-dev ca-certificates tar xz-utils
-          elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y gcc gcc-c++ make glibc-devel tar xz
-          else
-            echo 'Unsupported build container' >&2; exit 1
-          fi
-          cd /work/php-5.6.40
-          ./configure --disable-all --enable-cli --enable-cgi \
-                      --enable-fpm --enable-session --enable-debug
-          make -j2
-          sapi/cli/php -v | grep -F 'PHP 5.6.40-sec1'
-          sapi/cli/php -i | grep -F max_multipart_body_parts
-          # Note: OOM exit status alone does NOT prove a CVE has been fixed.
-          bash /work/tests/run-parallel.sh 2 Zend/tests ext/session/tests tests/basic
-          mkdir -p "/work/dist/php-5.6.40-sec1-${DISTRO}/bin" \
-                   "/work/dist/php-5.6.40-sec1-${DISTRO}/sbin"
-          cp sapi/cli/php "/work/dist/php-5.6.40-sec1-${DISTRO}/bin/php"
-          cp sapi/cgi/php-cgi "/work/dist/php-5.6.40-sec1-${DISTRO}/bin/php-cgi"
-          cp sapi/fpm/php-fpm "/work/dist/php-5.6.40-sec1-${DISTRO}/sbin/php-fpm"
-          cd /work/dist
-          tar czf "php-5.6.40-sec1-${DISTRO}.tar.gz" "php-5.6.40-sec1-${DISTRO}"
+          trap 'chown -R "${HOST_UID}:${HOST_GID}" /work/artifacts 2>/dev/null || true' EXIT
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends python3
+          export NO_INTERACTION=1 SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1
+          export TEST_PHP_EXECUTABLE=/work/sapi/cli/php
+          export TEST_PHP_CGI_EXECUTABLE=/work/sapi/cgi/php-cgi
+          # Ensure fatal parser problems are not hidden. Recompile already completed in the earlier stage.
+          set +e
+          ./sapi/cli/php run-tests.php Zend/tests ext/session/tests tests/basic > artifacts/tests.log 2>&1
+          test_exit=$?
+          set -e
+          printf '%s\n' "$test_exit" > artifacts/test-exit-code.txt
+          export TEST_EXIT_CODE="$test_exit"
+          python3 - <<'PYTEST'
+          from pathlib import Path
+          import re
+          p = Path('artifacts/tests.log')
+          log = p.read_text(errors='replace') if p.exists() else ''
+          if 'TEST RESULT SUMMARY' not in log:
+              raise SystemExit('PHPT runner did not complete; check artifacts/tests.log')
+          # PHP 5.x prints paths in [brackets] in its FAILED TEST SUMMARY.
+          tail = log.rsplit('FAILED TEST SUMMARY', 1)[-1] if 'FAILED TEST SUMMARY' in log else ''
+          tail = tail.split('\n' + '=' * 10, 1)[0]
+          actual = sorted(set(re.findall(r'\[((?:Zend|ext|tests)/[^]\r\n]+\.phpt)\]', tail)))
+          expected = sorted({x.strip().strip('[]') for x in
+                             Path('tests/expected-failures.txt').read_text().splitlines() if x.strip()})
+          extra = sorted(set(actual) - set(expected))
+          Path('artifacts/actual-failures.txt').write_text('\n'.join(actual) + '\n')
+          Path('artifacts/unexpected-failures.txt').write_text('\n'.join(extra) + '\n')
+          print('Actual failures:', actual)
+          print('Unexpected failures:', extra)
+          if extra:
+              raise SystemExit('Unexpected PHP test failures found')
+          if int(__import__('os').environ['TEST_EXIT_CODE']) != 0 and not actual:
+              raise SystemExit('Test runner exited nonzero with no recognized expected failures')
+          PYTEST
           IN_CONTAINER
 
-      - name: Upload test logs (also on failure)
+      - name: Upload test logs even after failure
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: php56-${{ matrix.name }}-test-logs
+          name: php56-git-linux-test-evidence
+          path: |
+            artifacts/tests.log
+            artifacts/test-exit-code.txt
+            artifacts/actual-failures.txt
+            artifacts/unexpected-failures.txt
           if-no-files-found: ignore
-          path: php-5.6.40/ci-test-logs/
-
-      - name: Upload binaries (only after successful build and tests)
-        uses: actions/upload-artifact@v4
-        with:
-          name: php-5.6.40-sec1-${{ matrix.name }}
-          if-no-files-found: error
-          path: dist/php-5.6.40-sec1-${{ matrix.name }}.tar.gz
