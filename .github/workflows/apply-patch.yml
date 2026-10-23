@@ -1,0 +1,48 @@
+name: apply-security-patch
+
+# 纯网页操作的核心:网页上传好补丁后,手动点一下这个 workflow,
+# 它自动把补丁应用到分支源码并提交回去,你全程不用碰命令行。
+#
+# 前置条件:Settings -> Actions -> General -> Workflow permissions
+#           选 "Read and write permissions"(否则无法提交回仓库)
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: PHP-5.6-CVE-2026-109618-109619
+
+      - name: Check patch not already applied
+        run: |
+          if grep -q "zend_mm_safe_error_ex" Zend/zend_alloc.c; then
+            echo "补丁已存在,跳过"; echo "skip=true" >> $GITHUB_OUTPUT
+          fi
+        id: check
+
+      - name: Apply patch
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          patch -p1 --dry-run < security-backports/php-5.6.40-CVE-2026-109618-109619.patch
+          patch -p1 < security-backports/php-5.6.40-CVE-2026-109618-109619.patch
+
+      - name: Commit
+        if: steps.check.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Avoid state corruption via bailout
+
+          Backport of the PHP-7.4-CVE-2026-109618-109619 security branch
+          to PHP 5.6, based on the php-5.6.40 release tag.
+
+          Fix GHSA-w8hw-w9fx-j79w (CVE-2026-109618)
+          Fix GHSA-6wmf-4rv5-p3rp (CVE-2026-109619)"
+          git push
