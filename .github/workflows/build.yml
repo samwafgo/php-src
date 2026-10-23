@@ -113,50 +113,94 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # IMPORTANT: -i keeps STDIN open so bash -se can read the heredoc below.
-          docker run --rm -i \
-            -v "$GITHUB_WORKSPACE:/work" -w /work \
-            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
-            ubuntu:20.04 bash -se <<'IN_CONTAINER'
+          mkdir -p artifacts
+          # The build ran in an Ubuntu 20.04 container with build dependencies.
+          # Recreate the runtime environment and CHECK the executable before PHPT.
+          # -i is mandatory: the inner bash reads commands from the heredoc.
+          if ! docker run --rm -i \
+              -v "$GITHUB_WORKSPACE:/work" -w /work \
+              -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+              ubuntu:20.04 bash -se <<'IN_CONTAINER'
           set -euo pipefail
           trap 'chown -R "${HOST_UID}:${HOST_GID}" /work/artifacts 2>/dev/null || true' EXIT
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y --no-install-recommends python3
+          apt-get install -y --no-install-recommends libcrypt1 ca-certificates
+          echo '=== PHPT runtime dependency diagnostics ==='
+          test -x sapi/cli/php
+          test -f run-tests.php
+          ldd sapi/cli/php | tee artifacts/php-runtime-ldd.txt
+          if grep -F 'not found' artifacts/php-runtime-ldd.txt; then
+            echo '[ERROR] A runtime shared library is missing from the test container.' >&2
+            exit 1
+          fi
+          sapi/cli/php -v
+          sapi/cli/php -r 'echo "PHP-RUNTIME-OK\n";'
           export NO_INTERACTION=1 SKIP_SLOW_TESTS=1 SKIP_ONLINE_TESTS=1
           export TEST_PHP_EXECUTABLE=/work/sapi/cli/php
           export TEST_PHP_CGI_EXECUTABLE=/work/sapi/cgi/php-cgi
-          # Ensure fatal parser problems are not hidden. Recompile already completed in the earlier stage.
+          # The test result can be nonzero because of genuine test failures.
           set +e
           ./sapi/cli/php run-tests.php Zend/tests ext/session/tests tests/basic > artifacts/tests.log 2>&1
           test_exit=$?
           set -e
           printf '%s\n' "$test_exit" > artifacts/test-exit-code.txt
-          export TEST_EXIT_CODE="$test_exit"
+          echo "[PHPT] runner exit code: $test_exit"
+          echo '=== PHPT log first 35 lines ==='
+          sed -n '1,35p' artifacts/tests.log
+          echo '=== PHPT log last 100 lines ==='
+          tail -n 100 artifacts/tests.log
+          IN_CONTAINER
+          then
+            echo '::error::Docker PHPT runtime/preflight failed. Check ldd above.'
+            [[ ! -f artifacts/tests.log ]] || tail -n 100 artifacts/tests.log
+            exit 1
+          fi
+
+          # Parse test evidence on the GitHub runner instead of installing Python
+          # in a second container; this does NOT reinterpret a crash as success.
           python3 - <<'PYTEST'
           from pathlib import Path
           import re
-          p = Path('artifacts/tests.log')
+
+          out = Path('artifacts')
+          p = out / 'tests.log'
           log = p.read_text(errors='replace') if p.exists() else ''
           if 'TEST RESULT SUMMARY' not in log:
-              raise SystemExit('PHPT runner did not complete; check artifacts/tests.log')
-          # PHP 5.x prints paths in [brackets] in its FAILED TEST SUMMARY.
-          tail = log.rsplit('FAILED TEST SUMMARY', 1)[-1] if 'FAILED TEST SUMMARY' in log else ''
-          tail = tail.split('\n' + '=' * 10, 1)[0]
-          actual = sorted(set(re.findall(r'\[((?:Zend|ext|tests)/[^]\r\n]+\.phpt)\]', tail)))
-          expected = sorted({x.strip().strip('[]') for x in
-                             Path('tests/expected-failures.txt').read_text().splitlines() if x.strip()})
-          extra = sorted(set(actual) - set(expected))
-          Path('artifacts/actual-failures.txt').write_text('\n'.join(actual) + '\n')
-          Path('artifacts/unexpected-failures.txt').write_text('\n'.join(extra) + '\n')
-          print('Actual failures:', actual)
-          print('Unexpected failures:', extra)
+              print('::error::PHPT did not reach its summary. See tests.log and first/last lines above.')
+              raise SystemExit(1)
+          if not re.search(r'^Number of tests\s*:', log, re.M):
+              print('::error::PHPT summary did not provide a test count.')
+              raise SystemExit(1)
+
+          # PHP 5.6 writes failures at the very end, under FAILED TEST SUMMARY.
+          match = re.search(r'(?ms)^FAILED TEST SUMMARY\s*\n[-]+\n(.*?)(?=^={10,}|\Z)', log)
+          section = match.group(1) if match else ''
+          actual = sorted(set(re.findall(r'\[((?:Zend|ext|tests)/[^]\r\n]+\.phpt)\]', section)))
+          expected_path = Path('tests/expected-failures.txt')
+          if not expected_path.exists():
+              raise SystemExit('Missing expected-failures file: ' + str(expected_path))
+          expected = {x.strip().strip('[]') for x in expected_path.read_text().splitlines() if x.strip()}
+          extra = sorted(set(actual) - expected)
+          now_passing = sorted(expected - set(actual))
+          (out / 'actual-failures.txt').write_text('\n'.join(actual) + ('\n' if actual else ''))
+          (out / 'unexpected-failures.txt').write_text('\n'.join(extra) + ('\n' if extra else ''))
+          (out / 'expected-now-passing.txt').write_text('\n'.join(now_passing) + ('\n' if now_passing else ''))
+          exit_code_path = out / 'test-exit-code.txt'
+          test_exit = int(exit_code_path.read_text().strip()) if exit_code_path.exists() else -1
+          print('PHPT runner exit code:', test_exit)
+          print('Known failures:', actual)
+          print('New/unexpected failures:', extra)
+          print('Expected but now passing:', now_passing)
+          for heading in ('BORKED TEST SUMMARY', 'LEAKED TEST SUMMARY'):
+              if re.search(r'^' + re.escape(heading) + r'$', log, re.M):
+                  raise SystemExit('::error::' + heading + ' present; inspect tests.log')
           if extra:
-              raise SystemExit('Unexpected PHP test failures found')
-          if int(__import__('os').environ['TEST_EXIT_CODE']) != 0 and not actual:
-              raise SystemExit('Test runner exited nonzero with no recognized expected failures')
+              raise SystemExit('::error::Unexpected PHP test failures')
+          if test_exit != 0 and not actual:
+              raise SystemExit('::error::PHPT runner exited nonzero without recognized failures')
+          print('PHPT analysis completed without unrecognized test failures.')
           PYTEST
-          IN_CONTAINER
 
       - name: Upload test logs even after failure
         if: always()
@@ -166,6 +210,8 @@ jobs:
           path: |
             artifacts/tests.log
             artifacts/test-exit-code.txt
+            artifacts/php-runtime-ldd.txt
             artifacts/actual-failures.txt
             artifacts/unexpected-failures.txt
+            artifacts/expected-now-passing.txt
           if-no-files-found: ignore
