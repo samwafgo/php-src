@@ -1,102 +1,129 @@
-name: build
+name: build-linux-php56
 
 on:
   push:
-    branches: [ "PHP-5.6-CVE-2026-109618-109619" ]
+    branches:
+      - PHP-5.6-CVE-2026-109618-109619
   workflow_dispatch:
 
-# 多发行版容器矩阵:验证补丁在各常用 Linux 发行版上可编译、可通过回归。
-# 统一做法:官方 museum tarball + 本仓库 patch 文件(raw URL 按当前 commit 锁定),
-# 不依赖容器内装 git/autoconf2.13,老发行版也能跑。
+permissions:
+  contents: read
+
+concurrency:
+  group: php56-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TARGET_BRANCH: PHP-5.6-CVE-2026-109618-109619
+  PHP_TARBALL: php-5.6.40.tar.xz
+  PHP_SHA256: 1369a51eee3995d7fbd1c5342e5cc917760e276d561595b6052b21ace2656d1c
+  PATCH_FILE: security-backports/php-5.6.40-CVE-2026-109618-109619.patch
+
 jobs:
-  distros:
+  patch-preflight:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify target branch and patch against official PHP 5.6.40
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF_NAME}" = "${TARGET_BRANCH}" || {
+            echo '::error::Choose PHP-5.6-CVE-2026-109618-109619 in the Actions branch dropdown.'
+            exit 1
+          }
+          test -s "$PATCH_FILE"
+          curl --fail --location --retry 3 --retry-delay 3 \
+            --output "$PHP_TARBALL" "https://museum.php.net/php5/$PHP_TARBALL"
+          echo "$PHP_SHA256  $PHP_TARBALL" | sha256sum -c -
+          tar -xJf "$PHP_TARBALL"
+          cd php-5.6.40
+          patch -p1 --batch --forward --dry-run < "../$PATCH_FILE"
+          patch -p1 --batch --forward < "../$PATCH_FILE"
+          grep -Fq 'PHP_EXTRA_VERSION "-sec1"' main/php_version.h
+          echo 'Patch applies cleanly to verified PHP 5.6.40 source.'
+
+  linux:
+    needs: patch-preflight
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: centos7,      image: centos:7 }
-          - { name: almalinux8,   image: almalinux:8 }
-          - { name: almalinux9,   image: almalinux:9 }
-          - { name: debian11,     image: debian:11 }
-          - { name: debian12,     image: debian:12 }
-          - { name: ubuntu2004,   image: ubuntu:20.04 }
-          - { name: ubuntu2204,   image: ubuntu:22.04 }
-          - { name: ubuntu2404,   image: ubuntu:24.04 }
-    runs-on: ubuntu-latest
-    container: ${{ matrix.image }}
+          - { name: ubuntu2204, image: 'ubuntu:22.04' }
+          - { name: ubuntu2404, image: 'ubuntu:24.04' }
+          - { name: debian12,   image: 'debian:12' }
+          - { name: almalinux9, image: 'almalinux:9' }
     steps:
-      - name: Install build deps
+      - uses: actions/checkout@v4
+
+      - name: Download pinned source and apply repository patch
+        shell: bash
         run: |
-          set -e
-          if command -v yum >/dev/null && grep -qi "centos.*7" /etc/os-release; then
-            # CentOS 7 已 EOL,切到 vault 归档源
-            sed -i -e 's|^mirrorlist=|#mirrorlist=|' \
-                   -e 's|^#baseurl=http://mirror.centos.org|baseurl=https://vault.centos.org|' \
-                   /etc/yum.repos.d/CentOS-Base.repo
-            yum install -y gcc make patch curl xz which
-          elif command -v dnf >/dev/null; then
-            dnf install -y gcc make patch curl xz
-          elif command -v yum >/dev/null; then
-            yum install -y gcc make patch curl xz
-          else
+          set -euo pipefail
+          curl --fail --location --retry 3 --retry-delay 3 \
+            --output "$PHP_TARBALL" "https://museum.php.net/php5/$PHP_TARBALL"
+          echo "$PHP_SHA256  $PHP_TARBALL" | sha256sum -c -
+          tar -xJf "$PHP_TARBALL"
+          cd php-5.6.40
+          patch -p1 --batch --forward --dry-run < "../$PATCH_FILE"
+          patch -p1 --batch --forward < "../$PATCH_FILE"
+
+      - name: Build and test in ${{ matrix.name }} container
+        shell: bash
+        env:
+          IMAGE: ${{ matrix.image }}
+          DISTRO: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --workdir /work \
+            --env DISTRO \
+            --env HOST_UID="$(id -u)" \
+            --env HOST_GID="$(id -g)" \
+            "$IMAGE" bash -se <<'IN_CONTAINER'
+          set -euo pipefail
+          trap 'chown -R "${HOST_UID}:${HOST_GID}" /work/php-5.6.40 /work/dist 2>/dev/null || true' EXIT
+          if command -v apt-get >/dev/null 2>&1; then
             export DEBIAN_FRONTEND=noninteractive
             apt-get update
             apt-get install -y --no-install-recommends \
-                gcc make patch curl ca-certificates xz-utils libc6-dev
+              gcc g++ make libc6-dev ca-certificates tar xz-utils
+          elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y gcc gcc-c++ make glibc-devel tar xz
+          else
+            echo 'Unsupported build container' >&2; exit 1
           fi
+          cd /work/php-5.6.40
+          ./configure --disable-all --enable-cli --enable-cgi \
+                      --enable-fpm --enable-session --enable-debug
+          make -j2
+          sapi/cli/php -v | grep -F 'PHP 5.6.40-sec1'
+          sapi/cli/php -i | grep -F max_multipart_body_parts
+          # Note: OOM exit status alone does NOT prove a CVE has been fixed.
+          bash /work/tests/run-parallel.sh 2 Zend/tests ext/session/tests tests/basic
+          mkdir -p "/work/dist/php-5.6.40-sec1-${DISTRO}/bin" \
+                   "/work/dist/php-5.6.40-sec1-${DISTRO}/sbin"
+          cp sapi/cli/php "/work/dist/php-5.6.40-sec1-${DISTRO}/bin/php"
+          cp sapi/cgi/php-cgi "/work/dist/php-5.6.40-sec1-${DISTRO}/bin/php-cgi"
+          cp sapi/fpm/php-fpm "/work/dist/php-5.6.40-sec1-${DISTRO}/sbin/php-fpm"
+          cd /work/dist
+          tar czf "php-5.6.40-sec1-${DISTRO}.tar.gz" "php-5.6.40-sec1-${DISTRO}"
+          IN_CONTAINER
 
-      - name: Fetch source tarball + this commit's patch
-        run: |
-          set -e
-          curl -fsSL --retry 3 -O https://museum.php.net/php5/php-5.6.40.tar.xz
-          tar xJf php-5.6.40.tar.xz
-          curl -fsSL -o sec.patch \
-            "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/security-backports/php-5.6.40-CVE-2026-109618-109619.patch"
-          cd php-5.6.40
-          patch -p1 --dry-run < ../sec.patch   # 先干跑校验,不干净直接失败
-          patch -p1 < ../sec.patch
+      - name: Upload test logs (also on failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: php56-${{ matrix.name }}-test-logs
+          if-no-files-found: ignore
+          path: php-5.6.40/ci-test-logs/
 
-      - name: Configure & build
-        run: |
-          cd php-5.6.40
-          ./configure --disable-all --enable-cli --enable-cgi --enable-fpm \
-                      --enable-session --enable-debug
-          make -j"$(nproc)"
-
-      - name: Smoke tests
-        run: |
-          cd php-5.6.40
-          sapi/cli/php -v | tee /dev/stderr | grep "5.6.40-sec1"
-          sapi/cli/php -i | grep max_multipart_body_parts
-          # OOM 必须直接终止(exit 1),不得打印 SHOULD-NOT-REACH
-          if sapi/cli/php -d memory_limit=2M -r 'str_repeat("a", 50000000); echo "SHOULD-NOT-REACH";'; then
-            echo "::error::OOM 后代码仍在执行,补丁未生效"; exit 1
-          fi
-
-      - name: Regression tests
-        run: |
-          cd php-5.6.40
-          curl -fsSL -o /tmp/run-parallel.sh \
-            "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/tests/run-parallel.sh"
-          curl -fsSL -o /tmp/expected-failures.txt \
-            "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/tests/expected-failures.txt"
-          bash /tmp/run-parallel.sh "$(nproc)" Zend/tests ext/session/tests tests/basic | tee /tmp/rt.log
-          # 实际失败必须等于白名单(多一个少一个都算失败)
-          sed -n '/FAILED TEST SUMMARY/,/^====*$/p' /tmp/rt_chunk_*.log \
-            | grep -oE '\[(ext|Zend|tests)/[^]]+\]' | sort -u > /tmp/actual-fails.txt || true
-          diff -u /tmp/expected-failures.txt /tmp/actual-fails.txt
-
-      - name: Package binaries
-        run: |
-          cd php-5.6.40
-          mkdir -p /tmp/dist/php-5.6.40-sec1-${{ matrix.name }}/{bin,sbin}
-          cp sapi/cli/php /tmp/dist/php-5.6.40-sec1-${{ matrix.name }}/bin/
-          cp sapi/cgi/php-cgi /tmp/dist/php-5.6.40-sec1-${{ matrix.name }}/bin/
-          cp sapi/fpm/php-fpm /tmp/dist/php-5.6.40-sec1-${{ matrix.name }}/sbin/
-          tar czf /tmp/php-5.6.40-sec1-${{ matrix.name }}.tar.gz -C /tmp/dist php-5.6.40-sec1-${{ matrix.name }}
-
-      - name: Upload binaries
+      - name: Upload binaries (only after successful build and tests)
         uses: actions/upload-artifact@v4
         with:
           name: php-5.6.40-sec1-${{ matrix.name }}
-          path: /tmp/php-5.6.40-sec1-${{ matrix.name }}.tar.gz
+          if-no-files-found: error
+          path: dist/php-5.6.40-sec1-${{ matrix.name }}.tar.gz

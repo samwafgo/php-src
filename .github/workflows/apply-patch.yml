@@ -1,48 +1,64 @@
 name: apply-security-patch
 
-# 纯网页操作的核心:网页上传好补丁后,手动点一下这个 workflow,
-# 它自动把补丁应用到分支源码并提交回去,你全程不用碰命令行。
-#
-# 前置条件:Settings -> Actions -> General -> Workflow permissions
-#           选 "Read and write permissions"(否则无法提交回仓库)
 on:
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: php56-security-patch
+  cancel-in-progress: false
+
 jobs:
   apply:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    env:
+      TARGET_BRANCH: PHP-5.6-CVE-2026-109618-109619
+      PATCH_FILE: security-backports/php-5.6.40-CVE-2026-109618-109619.patch
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the target PHP 5.6 branch
+        uses: actions/checkout@v4
         with:
           ref: PHP-5.6-CVE-2026-109618-109619
+          fetch-depth: 1
+          persist-credentials: true
 
-      - name: Check patch not already applied
+      - name: Check prerequisites and working tree
+        shell: bash
         run: |
-          if grep -q "zend_mm_safe_error_ex" Zend/zend_alloc.c; then
-            echo "补丁已存在,跳过"; echo "skip=true" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          test -f "$PATCH_FILE"
+          test -f Zend/zend_alloc.c
+          test -f main/php_version.h
+          git diff --exit-code
+          git diff --cached --exit-code
+          grep -q '#define PHP_VERSION "5.6.40"' main/php_version.h ||             grep -q '#define PHP_VERSION "5.6.40-sec1"' main/php_version.h
+
+      - name: Apply complete patch or recognize an already-applied patch
+        id: patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git apply --reverse --check "$PATCH_FILE"; then
+            echo 'Full patch already applied; no changes required.'
+            echo 'applied=false' >> "$GITHUB_OUTPUT"
+          else
+            git apply --check "$PATCH_FILE"
+            git apply "$PATCH_FILE"
+            git diff --check
+            echo 'applied=true' >> "$GITHUB_OUTPUT"
           fi
-        id: check
 
-      - name: Apply patch
-        if: steps.check.outputs.skip != 'true'
+      - name: Commit and push patch
+        if: steps.patch.outputs.applied == 'true'
+        shell: bash
         run: |
-          patch -p1 --dry-run < security-backports/php-5.6.40-CVE-2026-109618-109619.patch
-          patch -p1 < security-backports/php-5.6.40-CVE-2026-109618-109619.patch
-
-      - name: Commit
-        if: steps.check.outputs.skip != 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "Avoid state corruption via bailout
-
-          Backport of the PHP-7.4-CVE-2026-109618-109619 security branch
-          to PHP 5.6, based on the php-5.6.40 release tag.
-
-          Fix GHSA-w8hw-w9fx-j79w (CVE-2026-109618)
-          Fix GHSA-6wmf-4rv5-p3rp (CVE-2026-109619)"
-          git push
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -u
+          git diff --cached --check
+          git diff --cached --quiet && { echo 'Nothing to commit'; exit 0; }
+          git commit -m 'Backport PHP 5.6 CVE-2026-109618/109619 changes'
+          git push origin "HEAD:${TARGET_BRANCH}"
