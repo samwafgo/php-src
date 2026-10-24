@@ -1,0 +1,92 @@
+name: build-multi-windows-php56-candidates
+
+# No preflight-only green job. Every job must produce and execute real binaries.
+# Requires four clean jobs on provisioned legacy VC11 runners; see README.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: [self-hosted, Windows, X64, php56-vc11]
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86, x64]
+        threading: [nts, ts]
+    env:
+      VC11_VCVARSALL: ${{ vars.VC11_VCVARSALL }}
+      SDK_BIN: ${{ matrix.arch == 'x64' && vars.PHP56_SDK_BIN_X64 || vars.PHP56_SDK_BIN_X86 }}
+      TARGET_ARCH: ${{ matrix.arch }}
+      THREADING: ${{ matrix.threading }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          clean: true
+      - name: Verify applied patch and legacy SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF_NAME -ne 'PHP-5.6-CVE-2026-109618-109619') { throw 'Select patched PHP 5.6 branch' }
+          if (-not (Test-Path $env:VC11_VCVARSALL)) { throw 'Configure VC11_VCVARSALL' }
+          if (-not (Test-Path $env:SDK_BIN)) { throw 'Configure architecture-specific PHP56_SDK_BIN_X64/X86' }
+          if (-not (Select-String -Quiet main/php_version.h -SimpleMatch '5.6.40-sec1')) { throw 'Missing patched version' }
+          python ci/prepare-git-patch.py --source security-backports/php-5.6.40-CVE-2026-109618-109619.patch --output "$env:RUNNER_TEMP/php56-git.patch"
+          if ($LASTEXITCODE -ne 0) { throw 'Patch preparation failed' }
+          git apply --reverse --check "$env:RUNNER_TEMP/php56-git.patch"
+          if ($LASTEXITCODE -ne 0) { throw 'Incomplete source patch' }
+      - name: Compile VC11 CLI and CGI
+        shell: cmd
+        run: |
+          set PATH=%SDK_BIN%;%PATH%
+          set VCARCH=x86
+          if "%TARGET_ARCH%"=="x64" set VCARCH=amd64
+          call "%VC11_VCVARSALL%" %VCARCH% || exit /b 1
+          where nmake || exit /b 1
+          where bison || exit /b 1
+          call buildconf.bat || exit /b 1
+          set ZTS_OPT=--disable-zts
+          if "%THREADING%"=="ts" set ZTS_OPT=--enable-zts
+          cscript //nologo configure.js --disable-all --enable-cli --enable-cgi --enable-session %ZTS_OPT% || exit /b 1
+          nmake || exit /b 1
+      - name: Verify PE architecture, runtime DLLs, version and TS mode; package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $suffix = if ($env:THREADING -eq 'ts') { 'Release_TS' } else { 'Release' }
+          $build = if ($env:TARGET_ARCH -eq 'x64') { Join-Path 'x64' $suffix } else { $suffix }
+          if (-not (Test-Path "$build/php.exe")) { throw "Missing $build/php.exe" }
+          if (-not (Test-Path "$build/php-cgi.exe")) { throw "Missing $build/php-cgi.exe" }
+          $name = "php-5.6.40-sec1-windows-vc11-$env:TARGET_ARCH-$env:THREADING-core-candidate"
+          $out = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Get-ChildItem $build -File | Where-Object { $_.Extension -in '.exe','.dll' } | Copy-Item -Destination $out
+          foreach ($file in 'php.exe','php-cgi.exe') {
+            $bytes = [IO.File]::ReadAllBytes((Join-Path $out $file))
+            $pe = [BitConverter]::ToInt32($bytes,0x3c)
+            $machine = [BitConverter]::ToUInt16($bytes,$pe+4)
+            $expected = if ($env:TARGET_ARCH -eq 'x64') { 0x8664 } else { 0x14c }
+            if ($machine -ne $expected) { throw "Wrong PE architecture: $file" }
+            & "$out/$file" -n -v
+            if ($LASTEXITCODE -ne 0) { throw "Executable failed: $file" }
+          }
+          $zts = if ($env:THREADING -eq 'ts') { '1' } else { '0' }
+          & "$out/php.exe" -n -r "if (PHP_VERSION !== '5.6.40-sec1' || (int)PHP_ZTS !== $zts || !extension_loaded('session')) exit(1); echo 'runtime-ok';"
+          if ($LASTEXITCODE -ne 0) { throw 'Version / TS / session mismatch' }
+          Copy-Item LICENSE $out
+          $manifest = [ordered]@{ version='5.6.40-sec1'; commit=$env:GITHUB_SHA; arch=$env:TARGET_ARCH; threading=$env:THREADING; compiler='VC11'; profile='core'; status='candidate'; phpt='not run'; cve_security_validation='not performed'; limitation='Core-only CLI/CGI; no FPM; SDK/runtime dependencies must be provisioned; not a Baota replacement'; files=@{} }
+          Get-ChildItem $out -File | ForEach-Object { $manifest.files[$_.Name] = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 "$out/MANIFEST.json"
+          New-Item -ItemType Directory -Force artifacts/windows | Out-Null
+          Compress-Archive -Path $out -DestinationPath "artifacts/windows/$name.zip"
+          (Get-FileHash "artifacts/windows/$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Set-Content "artifacts/windows/SHA256SUMS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: php56-windows-vc11-${{ matrix.arch }}-${{ matrix.threading }}-core-candidate
+          path: artifacts/windows/
+          if-no-files-found: error
+          retention-days: 14

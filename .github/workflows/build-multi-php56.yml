@@ -1,0 +1,77 @@
+name: build-multi-php56-candidates
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 'all = 15 Linux targets; smoke = 4 x86_64 targets'
+        type: choice
+        options: [all, smoke]
+        default: all
+      profile:
+        description: 'web-release is a limited-extension candidate, debug-test is regression only'
+        type: choice
+        options: [web-release, debug-test]
+        default: web-release
+  push:
+    branches: [PHP-5.6-CVE-2026-109618-109619]
+    paths: [.github/workflows/build-multi-php56.yml, 'ci/multibuild/**']
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: matrix
+        shell: bash
+        env:
+          SCOPE: ${{ inputs.scope || 'all' }}
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF_NAME}" = PHP-5.6-CVE-2026-109618-109619
+          echo "matrix=$(python3 ci/multibuild/matrix.py "$SCOPE")" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      TARGET: ${{ matrix.target }}
+      PROFILE: ${{ inputs.profile || 'web-release' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build, validate PHPT, and test package in clean runtime
+        shell: bash
+        run: bash ci/multibuild/build-target.sh "$TARGET" "$PROFILE"
+      - name: Upload validated candidate binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: php56-${{ matrix.target }}-${{ env.PROFILE }}-candidate
+          path: artifacts/multibuild/${{ matrix.target }}-${{ env.PROFILE }}/binaries/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload diagnostics even when the build fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: php56-${{ matrix.target }}-${{ env.PROFILE }}-evidence
+          path: |
+            artifacts/multibuild/${{ matrix.target }}-${{ env.PROFILE }}/*.txt
+            artifacts/multibuild/${{ matrix.target }}-${{ env.PROFILE }}/*.log
+            artifacts/multibuild/${{ matrix.target }}-${{ env.PROFILE }}/*.json
+            artifacts/multibuild/${{ matrix.target }}-${{ env.PROFILE }}/failed-tests/
+          if-no-files-found: warn
+          retention-days: 14
