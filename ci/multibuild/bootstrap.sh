@@ -2,10 +2,11 @@
 # Executed only inside the disposable build container.
 set -euo pipefail
 source /etc/os-release
+bash "$(dirname "$0")/configure-repos.sh"
 case "$ID:$VERSION_ID" in
   ubuntu:*|debian:*)
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
+    apt-get -o Acquire::Retries=3 update
     apt-get install -y --no-install-recommends autoconf automake libtool \
       build-essential pkg-config perl ca-certificates libxml2-dev zlib1g-dev python3
     ;;

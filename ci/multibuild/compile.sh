@@ -18,6 +18,8 @@ case "$profile" in
   *) echo "Unknown profile: $profile" >&2; exit 1;;
 esac
 export CFLAGS="-O2 -fno-strict-aliasing -fwrapv -fcommon ${CFLAGS:-}"
+${CC:-cc} $CFLAGS -I. ci/multibuild/test_multiply.c -o "$out/test-multiply"
+"$out/test-multiply" | tee "$out/multiply-smoke.txt"
 ./buildconf --force
 ./configure --prefix="$prefix" --with-config-file-path="$prefix/etc" \
   --with-config-file-scan-dir="$prefix/etc/conf.d" --disable-all \

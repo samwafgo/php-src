@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source /etc/os-release
+bash "$(dirname "$0")/configure-repos.sh"
 case "$ID" in
   ubuntu|debian)
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
+    apt-get -o Acquire::Retries=3 update
     apt-get install -y --no-install-recommends libxml2 zlib1g ca-certificates python3
     ;;
   almalinux) dnf install -y libxml2 zlib ca-certificates python3 ;;

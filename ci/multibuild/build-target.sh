@@ -27,11 +27,12 @@ cp -a ci/multibuild "$work/src/ci/"
 curl -fLsS --retry 3 --connect-timeout 15 --max-time 180 \
   https://museum.php.net/php5/php-5.6.40.tar.xz -o "$work/php-5.6.40.tar.xz"
 python3 ci/multibuild/prepare_parsers.py "$work/php-5.6.40.tar.xz" "$work/src" "$out/parser-provenance.json"
+python3 ci/multibuild/prepare_compat.py "$work/src" "$arch" "$out/compat-provenance.json"
 digest=native-host-no-container
 if [[ "$mode" == native ]]; then
   python3 ci/multibuild/verify_target.py "$target"
   bash ci/multibuild/compile.sh "$work/src" "$out" "$profile"
-  python3 ci/multibuild/phpt.py "$out" tests/expected-failures.txt
+  python3 ci/multibuild/phpt.py "$out" tests/expected-failures.txt --profile "$profile"
   bash ci/multibuild/verify-package.sh "$out/package" "$out" "$target"
 else
   [[ $(uname -m) == "$arch" ]] || { echo 'Use the native runner for this CPU architecture' >&2; exit 1; }
@@ -42,7 +43,7 @@ else
     -e BUILD_JOBS="${BUILD_JOBS:-2}" -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" "$digest" bash -c \
     'trap '\''chown -R "$HOST_UID:$HOST_GID" /work /out || true'\'' EXIT
      bash /work/ci/multibuild/bootstrap.sh && bash /work/ci/multibuild/compile.sh /work /out "$1"' _ "$profile"
-  python3 ci/multibuild/phpt.py "$out" tests/expected-failures.txt
+  python3 ci/multibuild/phpt.py "$out" tests/expected-failures.txt --profile "$profile"
   docker run --rm --platform "$platform" -v "$work/src:/work:ro" -v "$out:/out" \
     -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" "$digest" bash -c \
     'trap '\''chown -R "$HOST_UID:$HOST_GID" /out || true'\'' EXIT

@@ -33,6 +33,7 @@ manifest=dict(version='5.6.40-sec1',upstream_base='5.6.40',target=a.target,
     glibc=text('glibc.txt'),compiler=text('compiler.txt'),cflags=text('cflags.txt'),
     configure_args=text('configure-args.txt').splitlines(),modules=text('modules.txt').splitlines(),
     generated_parser_provenance=json.loads(text('parser-provenance.json')),
+    build_compatibility_provenance=json.loads(text('compat-provenance.json')),
     phpt=results,fpm_smoke='PASS: normal multipart upload, one worker, two sessions requests',
     limitations=['session.upload_progress disabled in C, regardless of INI',
       'limited PHPT scope; allowlisted FAIL is separate from XFAIL',
@@ -51,7 +52,7 @@ manifest=dict(version='5.6.40-sec1',upstream_base='5.6.40',target=a.target,
 evidence=package/'build-evidence'
 evidence.mkdir(exist_ok=True)
 import shutil
-for file in ['test-results.json','fpm-smoke.log','version.txt','modules.txt','ldd.txt','configure-args.txt','parser-provenance.json']:
+for file in ['test-results.json','fpm-smoke.log','version.txt','modules.txt','ldd.txt','configure-args.txt','parser-provenance.json','compat-provenance.json','multiply-smoke.txt']:
     shutil.copyfile(out/file,evidence/file)
 dest=out/'binaries'
 dest.mkdir(exist_ok=True)
