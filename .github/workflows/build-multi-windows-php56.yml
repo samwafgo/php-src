@@ -102,13 +102,22 @@ jobs:
         run: |
           python ci/windows/summarize.py artifacts/windows
           if ($LASTEXITCODE -ne 0) { throw 'Could not summarize build results' }
-      - name: Upload installer and build diagnostics
+      # Keep each artifact on one Windows drive. The build workspace is on D:
+      # and the toolchain is on C:, so they have no shared filesystem root.
+      - name: Upload build diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: php56-windows-build-evidence
+          path: artifacts/windows/**/evidence/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Upload installer diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: php56-windows-toolchain-evidence
           path: |
-            artifacts/windows/**/evidence/
             C:/php56-vc11/logs/
             C:/php56-vc11/toolchain.json
           if-no-files-found: warn
