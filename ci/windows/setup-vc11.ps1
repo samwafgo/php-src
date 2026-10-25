@@ -96,6 +96,9 @@ foreach ($arch in @('x86','x64')) {
     $expect = if ($arch -eq 'x64') { '1' } else { '0' }
     $exe = Join-Path $smoke ('compiler-' + $arch + '.exe')
     $batch = Join-Path $smoke ('compiler-' + $arch + '.cmd')
+    # VC11 RTM treats the colon in /Fe:"path" as part of the output name.
+    # Use the legacy /Fe"path" form for both compiler targets.
+    Write-Host "Verifying VC11 $arch compiler and runtime (legacy /Fe syntax)"
     Write-CmdBatch $batch @(
         '@echo off',
         ('set "VS110COMNTOOLS='+$commonTools+'"'),
@@ -105,7 +108,7 @@ foreach ($arch in @('x86','x64')) {
         ('set "BISON_SIMPLE='+$sdkBin+'\bison.simple"'),
         'where cl || exit /b 1', 'where nmake || exit /b 1',
         'bison --version || exit /b 1',
-        ('cl /nologo /MD /DEXPECT_X64='+$expect+' "'+$source+'" /Fe:"'+$exe+'" || exit /b 1'),
+        ('cl /nologo /MD /DEXPECT_X64='+$expect+' "'+$source+'" /Fe"'+$exe+'" || exit /b 1'),
         ('"'+$exe+'" || exit /b 1'), 'exit /b 0'
     )
     $null = Invoke-CmdBatch $batch (Join-Path $logs ('compiler-' + $arch + '.log')) $smoke 120
