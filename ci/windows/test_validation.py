@@ -6,6 +6,11 @@ import struct
 import tempfile
 import unittest
 from unittest.mock import patch
+import contextlib
+import io
+import runpy
+import subprocess
+import sys
 
 BASE=Path(__file__).resolve().parent
 spec=importlib.util.spec_from_file_location('verify_windows',BASE/'verify_windows.py')
@@ -21,6 +26,38 @@ def pe(path,machine):
     path.write_bytes(data)
 
 class VerificationTests(unittest.TestCase):
+    def generate_patch(self, destination, simulate_windows=False):
+        root=BASE.parent.parent
+        helper=root/'ci/prepare-git-patch.py'
+        args=[str(helper),'--source',str(root/'security-backports/php-5.6.40-CVE-2026-109618-109619.patch'),
+              '--output',str(destination)]
+        original_write_text=Path.write_text
+        def windows_text_write(path,data,*positional,**kwargs):
+            # Reproduce Windows text-mode translation even when tests run on Linux.
+            newline=kwargs.pop('newline',None)
+            if newline is None:data=data.replace('\n','\r\n')
+            return original_write_text(path,data,*positional,newline='',**kwargs)
+        with patch.object(sys,'argv',args), contextlib.redirect_stdout(io.StringIO()):
+            if simulate_windows:
+                with patch.object(Path,'write_text',windows_text_write):
+                    runpy.run_path(str(helper),run_name='__main__')
+            else:runpy.run_path(str(helper),run_name='__main__')
+    def test_patch_writer_preserves_lf_under_windows_translation(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/'git.patch'
+            self.generate_patch(p,simulate_windows=True)
+            data=p.read_bytes()
+            self.assertNotIn(b'\r',data)
+            self.assertFalse(data.startswith(b'\xef\xbb\xbf'))
+            self.assertEqual(data.count(b'--- a/'),16)
+            self.assertNotIn(b'--- a/configure\n',data)
+    def test_generated_patch_passes_original_strict_reverse_check(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/'git.patch'
+            self.generate_patch(p)
+            result=subprocess.run(['git','apply','--reverse','--check',str(p)],
+                cwd=BASE.parent.parent,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            self.assertEqual(result.returncode,0,result.stderr)
     def test_both_pe_architectures(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/'binary'
