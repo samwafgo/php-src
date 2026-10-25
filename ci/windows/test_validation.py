@@ -26,6 +26,54 @@ def pe(path,machine):
     path.write_bytes(data)
 
 class VerificationTests(unittest.TestCase):
+    def runtime_output(self, threading, integer_bits=32, cgi_integer_bits=32):
+        counter=0
+        def output(argv, **kwargs):
+            nonlocal counter
+            if '-r' in argv:
+                return ('5.6.40-sec1|'+threading+'|'+str(integer_bits)+'|session').encode()
+            if '-v' in argv:
+                return b'PHP 5.6.40-sec1'
+            counter+=1
+            self.assertEqual(Path(argv[0]).name,'php-cgi.exe')
+            self.assertIn(b'filename="safe.txt"',kwargs['input'])
+            body='|'.join(['safe.txt','0',v.hashlib.md5(b'ordinary-php56-windows-upload\n').hexdigest(),
+                           str(counter),'0','5.6.40-sec1',threading,str(cgi_integer_bits)])
+            return b'Content-Type: text/plain\r\n\r\n'+body.encode()
+        return output
+    def windows_package(self, package, arch, threading):
+        for name in ('php.exe','php-cgi.exe','php5ts.dll' if threading=='ts' else 'php5.dll'):
+            pe(package/name,0x8664 if arch=='x64' else 0x14c)
+    def test_all_windows_php56_configurations_use_32bit_integers(self):
+        for arch in ('x86','x64'):
+            for threading in ('nts','ts'):
+                with self.subTest(arch=arch,threading=threading), tempfile.TemporaryDirectory() as d:
+                    package=Path(d)
+                    self.windows_package(package,arch,threading)
+                    with patch.object(v,'run',side_effect=self.runtime_output(threading)) as runtime:
+                        result=v.verify(package,arch,threading)
+                    self.assertEqual(result['status'],'PASS')
+                    self.assertEqual(result['pe_architecture'],arch)
+                    self.assertEqual(result['cli'],'5.6.40-sec1|'+threading+'|32|session')
+                    self.assertEqual(runtime.call_count,5) # CLI, two versions, two CGI uploads
+    def test_mixed_x86_binaries_still_rejected_in_x64_package(self):
+        for name in ('php.exe','php-cgi.exe','php5.dll'):
+            with self.subTest(file=name), tempfile.TemporaryDirectory() as d:
+                package=Path(d)
+                self.windows_package(package,'x64','nts')
+                pe(package/name,0x14c)
+                with patch.object(v,'run') as runtime:
+                    with self.assertRaisesRegex(ValueError,'Wrong architecture'):
+                        v.verify(package,'x64','nts')
+                    runtime.assert_not_called()
+    def test_unexpected_64bit_integer_model_rejected_in_cli_and_cgi(self):
+        for cli_bits,cgi_bits in ((64,32),(32,64)):
+            with self.subTest(cli=cli_bits,cgi=cgi_bits), tempfile.TemporaryDirectory() as d:
+                package=Path(d)
+                self.windows_package(package,'x64','nts')
+                with patch.object(v,'run',side_effect=self.runtime_output('nts',cli_bits,cgi_bits)):
+                    with self.assertRaisesRegex(ValueError,'mismatch'):
+                        v.verify(package,'x64','nts')
     def generate_patch(self, destination, simulate_windows=False):
         root=BASE.parent.parent
         helper=root/'ci/prepare-git-patch.py'

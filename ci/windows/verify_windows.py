@@ -48,11 +48,14 @@ def verify(package, arch, threading):
         if pe_architecture(file)!=arch: raise ValueError('Wrong architecture: '+file.name)
     if not (package/('php5ts.dll' if threading=='ts' else 'php5.dll')).is_file():
         raise ValueError('Missing matching PHP runtime DLL')
-    bitness='64' if arch=='x64' else '32'
+    # PHP 5.6 uses sizeof(long) for PHP_INT_SIZE. Windows keeps long at
+    # 32 bits on x64 too (LLP64); executable architecture is checked above
+    # using the PE Machine field, independently of PHP integer width.
+    integer_bits='32'
     code='echo PHP_VERSION,"|",(PHP_ZTS?"ts":"nts"),"|",PHP_INT_SIZE*8,"|",(extension_loaded("session")?"session":"missing");'
     cli=run([str(php),'-n','-r',code],cwd=str(package)).decode().strip()
-    if cli!='5.6.40-sec1|'+threading+'|'+bitness+'|session':
-        raise ValueError('Version/threading/bitness/session mismatch: '+cli)
+    if cli!='5.6.40-sec1|'+threading+'|'+integer_bits+'|session':
+        raise ValueError('Version/threading/integer-width/session mismatch: '+cli)
     for binary in [php,cgi]:
         if 'PHP 5.6.40-sec1' not in run([str(binary),'-n','-v'],cwd=str(package)).decode():
             raise ValueError('Wrong PHP version: '+binary.name)
@@ -81,9 +84,10 @@ echo $f['name'],'|',$f['error'],'|',md5_file($f['tmp_name']),'|',$_SESSION['coun
         for i in (1,2):
             response=parse_cgi(run([str(cgi),'-n'],input=body,env=env,cwd=str(package)))
             expected='|'.join(['safe.txt','0',hashlib.md5(payload).hexdigest(),str(i),'0',
-                               '5.6.40-sec1',threading,bitness])
+                               '5.6.40-sec1',threading,integer_bits])
             if response!=expected: raise ValueError('CGI upload/session check mismatch: '+response)
     return dict(status='PASS',cli=cli,pe_architecture=arch,threading=threading,
+                php_integer_bits=int(integer_bits),
                 cgi='two multipart uploads, persisted Session counter 1/2, upload progress absent',
                 phpt='not run',iis_apache='not tested',cve_exploit_regression='not run')
 
