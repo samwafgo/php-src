@@ -1,0 +1,587 @@
+--- a/NEWS
++++ b/NEWS
+@@ -1,5 +1,13 @@
+ PHP                                                                        NEWS
+ |||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||
++23 Oct 2026, PHP 5.6.40-sec1 (unofficial community security backport)
++
++- Core:
++  . Fixed GHSA-w8hw-w9fx-j79w (Avoid state corruption via bailout).
++    (CVE-2026-109618)
++  . Fixed GHSA-6wmf-4rv5-p3rp (Avoid state corruption via bailout).
++    (CVE-2026-109619)
++
+ 10 Jan 2019, PHP 5.6.40
+ 
+ - GD:
+--- a/configure
++++ b/configure
+@@ -3673,7 +3673,7 @@
+ PHP_MAJOR_VERSION=5
+ PHP_MINOR_VERSION=6
+ PHP_RELEASE_VERSION=40
+-PHP_EXTRA_VERSION=""
++PHP_EXTRA_VERSION="-sec1"
+ PHP_VERSION="$PHP_MAJOR_VERSION.$PHP_MINOR_VERSION.$PHP_RELEASE_VERSION$PHP_EXTRA_VERSION"
+ PHP_VERSION_ID=`expr $PHP_MAJOR_VERSION \* 10000 + $PHP_MINOR_VERSION \* 100 + $PHP_RELEASE_VERSION`
+ 
+--- a/configure.in
++++ b/configure.in
+@@ -120,7 +120,7 @@
+ PHP_MAJOR_VERSION=5
+ PHP_MINOR_VERSION=6
+ PHP_RELEASE_VERSION=40
+-PHP_EXTRA_VERSION=""
++PHP_EXTRA_VERSION="-sec1"
+ PHP_VERSION="$PHP_MAJOR_VERSION.$PHP_MINOR_VERSION.$PHP_RELEASE_VERSION$PHP_EXTRA_VERSION"
+ PHP_VERSION_ID=`expr [$]PHP_MAJOR_VERSION \* 10000 + [$]PHP_MINOR_VERSION \* 100 + [$]PHP_RELEASE_VERSION`
+ 
+--- a/main/php_version.h
++++ b/main/php_version.h
+@@ -3,6 +3,6 @@
+ #define PHP_MAJOR_VERSION 5
+ #define PHP_MINOR_VERSION 6
+ #define PHP_RELEASE_VERSION 40
+-#define PHP_EXTRA_VERSION ""
+-#define PHP_VERSION "5.6.40"
++#define PHP_EXTRA_VERSION "-sec1"
++#define PHP_VERSION "5.6.40-sec1"
+ #define PHP_VERSION_ID 50640
+--- a/Zend/zend_alloc.c
++++ b/Zend/zend_alloc.c
+@@ -91,7 +91,9 @@
+ #if ZEND_DEBUG && defined(HAVE_KILL) && defined(HAVE_GETPID)
+ 	kill(getpid(), SIGSEGV);
+ #endif
+-	exit(1);
++	/* Use _exit(): plain exit() would run atexit/shutdown handlers on
++	 * potentially corrupted engine state (CVE-2026-109618 hardening). */
++	_exit(1);
+ }
+ 
+ /*******************/
+@@ -1740,6 +1742,50 @@
+ 	}
+ }
+ 
++/*
++ * GHSA-w8hw-w9fx-j79w (CVE-2026-109618) backport from PHP-7.4 security branch.
++ *
++ * On OOM the engine state may be inconsistent; performing a bailout
++ * (longjmp) from the memory manager corrupts global state which can be
++ * abused for remote code execution. Instead, print the error directly to
++ * stderr (without allocating) and terminate the process immediately.
++ * Under PHP-FPM / mod_php the master respawns a clean worker.
++ */
++ZEND_API void zend_mm_safe_error_ex(const char *format, ...)
++{
++	const char *error_filename;
++	uint error_lineno;
++	char buf[1024];
++	va_list args;
++
++	TSRMLS_FETCH();
++	if (zend_is_compiling(TSRMLS_C)) {
++		error_filename = zend_get_compiled_filename(TSRMLS_C);
++		error_lineno = zend_get_compiled_lineno(TSRMLS_C);
++	} else if (EG(in_execution)) {
++		error_filename = EG(active_op_array)?EG(active_op_array)->filename:NULL;
++		error_lineno = EG(opline_ptr)?(*EG(opline_ptr))->lineno:0;
++	} else {
++		error_filename = NULL;
++		error_lineno = 0;
++	}
++	if (!error_filename) {
++		error_filename = "Unknown";
++	}
++
++	va_start(args, format);
++	vsnprintf(buf, sizeof(buf), format, args);
++	va_end(args);
++
++	fprintf(stderr, "\nFatal error: %s in %s on line %d\n", buf, error_filename, error_lineno);
++/* See http://support.microsoft.com/kb/190351 */
++#ifdef PHP_WIN32
++	fflush(stderr);
++#endif
++	/* Never bailout: terminate the worker to guarantee clean state. */
++	_exit(1);
++}
++
+ static void zend_mm_safe_error(zend_mm_heap *heap,
+ 	const char *format,
+ 	size_t limit,
+@@ -1753,55 +1799,13 @@
+ 		_zend_mm_free_int(heap, heap->reserve ZEND_FILE_LINE_CC ZEND_FILE_LINE_EMPTY_CC);
+ 		heap->reserve = NULL;
+ 	}
+-	if (heap->overflow == 0) {
+-		const char *error_filename;
+-		uint error_lineno;
+-		TSRMLS_FETCH();
+-		if (zend_is_compiling(TSRMLS_C)) {
+-			error_filename = zend_get_compiled_filename(TSRMLS_C);
+-			error_lineno = zend_get_compiled_lineno(TSRMLS_C);
+-		} else if (EG(in_execution)) {
+-			error_filename = EG(active_op_array)?EG(active_op_array)->filename:NULL;
+-			error_lineno = EG(opline_ptr)?(*EG(opline_ptr))->lineno:0;
+-		} else {
+-			error_filename = NULL;
+-			error_lineno = 0;
+-		}
+-		if (!error_filename) {
+-			error_filename = "Unknown";
+-		}
+-		heap->overflow = 1;
+-		zend_try {
+-			zend_error_noreturn(E_ERROR,
+-				format,
+-				limit,
++	zend_mm_safe_error_ex(format,
++		limit,
+ #if ZEND_DEBUG
+-				filename,
+-				lineno,
++		filename,
++		lineno,
+ #endif
+-				size);
+-		} zend_catch {
+-			if (heap->overflow == 2) {
+-				fprintf(stderr, "\nFatal error: ");
+-				fprintf(stderr,
+-					format,
+-					limit,
+-#if ZEND_DEBUG
+-					filename,
+-					lineno,
+-#endif
+-					size);
+-				fprintf(stderr, " in %s on line %d\n", error_filename, error_lineno);
+-			}
+-/* See http://support.microsoft.com/kb/190351 */
+-#ifdef PHP_WIN32
+-			fflush(stderr);
+-#endif
+-		} zend_end_try();
+-	} else {
+-		heap->overflow = 2;
+-	}
+-	zend_bailout();
++		size);
+ }
+ 
+ static zend_mm_free_block *zend_mm_search_large_block(zend_mm_heap *heap, size_t true_size)
+@@ -2472,7 +2476,7 @@
+ 	       "rm"(offset));
+ 
+ 	if (UNEXPECTED(overflow)) {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
++		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+ 		return 0;
+ 	}
+ 	return res;
+@@ -2501,7 +2505,7 @@
+ 
+ #undef LP_SUFF
+         if (UNEXPECTED(overflow)) {
+-                zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
++                zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+                 return 0;
+         }
+         return res;
+@@ -2522,7 +2526,7 @@
+                "1"(0));
+ 
+         if (UNEXPECTED(overflow)) {
+-                zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
++                zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+                 return 0;
+         }
+         return res;
+@@ -2542,7 +2546,7 @@
+                "r"(offset));
+ 
+         if (UNEXPECTED(overflow)) {
+-                zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
++                zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+                 return 0;
+         }
+         return res;
+@@ -2555,7 +2559,7 @@
+ 	zend_ulong64 res = (zend_ulong64)nmemb * (zend_ulong64)size + (zend_ulong64)offset;
+ 
+ 	if (UNEXPECTED(res > (zend_ulong64)0xFFFFFFFFL)) {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
++		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+ 		return 0;
+ 	}
+ 	return (size_t) res;
+@@ -2570,7 +2574,7 @@
+ 	double _delta = (double)res - _d;
+ 
+ 	if (UNEXPECTED((_d + _delta ) != _d)) {
+-		zend_error_noreturn(E_ERROR, "Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
++		zend_mm_safe_error_ex("Possible integer overflow in memory allocation (%zu * %zu + %zu)", nmemb, size, offset);
+ 		return 0;
+ 	}
+ 	return res;
+@@ -2582,7 +2586,7 @@
+ {
+ 	size_t str_size = safe_address(nmemb, size, offset);
+ 	if (UNEXPECTED(str_size > INT_MAX)) {
+-		zend_error_noreturn(E_ERROR, "String allocation overflow, max size is %d", INT_MAX);
++		zend_mm_safe_error_ex("String allocation overflow, max size is %d", INT_MAX);
+ 	}
+ 	return emalloc_rel(str_size);
+ }
+--- a/Zend/zend_alloc.h
++++ b/Zend/zend_alloc.h
+@@ -54,6 +54,10 @@
+ 
+ ZEND_API char *zend_strndup(const char *s, unsigned int length) ZEND_ATTRIBUTE_MALLOC;
+ 
++/* GHSA-w8hw-w9fx-j79w (CVE-2026-109618) backport: OOM safe error that
++ * never bails out; prints to stderr and terminates the process. */
++ZEND_API void zend_mm_safe_error_ex(const char *format, ...);
++
+ ZEND_API void *_emalloc(size_t size ZEND_FILE_LINE_DC ZEND_FILE_LINE_ORIG_DC) ZEND_ATTRIBUTE_MALLOC ZEND_ATTRIBUTE_ALLOC_SIZE(1);
+ ZEND_API void *_safe_emalloc(size_t nmemb, size_t size, size_t offset ZEND_FILE_LINE_DC ZEND_FILE_LINE_ORIG_DC) ZEND_ATTRIBUTE_MALLOC;
+ ZEND_API void *_safe_emalloc_string(size_t nmemb, size_t size, size_t offset ZEND_FILE_LINE_DC ZEND_FILE_LINE_ORIG_DC) ZEND_ATTRIBUTE_MALLOC;
+--- a/Zend/zend_strtod.c
++++ b/Zend/zend_strtod.c
+@@ -490,7 +490,8 @@
+ 		rv = (Bigint *)MALLOC(sizeof(Bigint) + (x-1)*sizeof(Long));
+ 		if (!rv) {
+ 			_THREAD_PRIVATE_MUTEX_UNLOCK(dtoa_mutex);
+-			zend_error(E_ERROR, "Balloc() failed to allocate memory");
++			/* GHSA-w8hw-w9fx-j79w (CVE-2026-109618): do not bail out on OOM */
++			zend_mm_safe_error_ex("Balloc() failed to allocate memory");
+ 		}
+ 		rv->k = k;
+ 		rv->maxwds = x;
+--- a/Zend/zend_llist.c
++++ b/Zend/zend_llist.c
+@@ -116,6 +116,10 @@
+ 	}
+ 
+ 	l->count = 0;
++	/* GHSA-6wmf-4rv5-p3rp (CVE-2026-109619): leave no stale pointers
++	 * behind; a destroyed list must look empty if it is touched again. */
++	l->head  = NULL;
++	l->tail  = NULL;
+ }
+ 
+ 
+--- a/Zend/zend_execute_API.c
++++ b/Zend/zend_execute_API.c
+@@ -330,6 +330,18 @@
+ 
+ 	zend_shutdown_fpu(TSRMLS_C);
+ 
++	/* GHSA-6wmf-4rv5-p3rp (CVE-2026-109619) backport from PHP-7.4
++	 * security branch: these globals may be accessed before
++	 * init_executor() of the next request (e.g. by error handling
++	 * triggered in between). Leave no stale state behind. */
++	EG(error_handling) = EH_NORMAL;
++	EG(exception) = NULL;
++	memset(&EG(user_error_handlers_error_reporting), 0, sizeof(EG(user_error_handlers_error_reporting)));
++	memset(&EG(user_error_handlers), 0, sizeof(EG(user_error_handlers)));
++	memset(&EG(user_exception_handlers), 0, sizeof(EG(user_exception_handlers)));
++	EG(objects_store).object_buckets = NULL;
++	EG(objects_store).top = 1;
++
+ 	EG(active) = 0;
+ }
+ /* }}} */
+--- a/Zend/zend_operators.c
++++ b/Zend/zend_operators.c
+@@ -1400,7 +1400,7 @@
+ 	char *buf;
+ 
+ 	if (UNEXPECTED(length < 0)) {
+-		zend_error(E_ERROR, "String size overflow");
++		zend_mm_safe_error_ex("String size overflow");
+ 	}
+ 
+ 	buf = str_erealloc(Z_STRVAL_P(op1), length + 1);
+@@ -1419,7 +1419,7 @@
+ 	char *buf;
+ 
+ 	if (UNEXPECTED(length < 0)) {
+-		zend_error(E_ERROR, "String size overflow");
++		zend_mm_safe_error_ex("String size overflow");
+ 	}
+ 
+ 	buf = str_erealloc(Z_STRVAL_P(op1), length + 1);
+@@ -1465,7 +1465,7 @@
+ 		if (Z_STRLEN_P(result) < 0 || (int) (Z_STRLEN_P(op1) + Z_STRLEN_P(op2)) < 0) {
+ 			efree(Z_STRVAL_P(result));
+ 			ZVAL_EMPTY_STRING(result);
+-			zend_error(E_ERROR, "String size overflow");
++			zend_mm_safe_error_ex("String size overflow");
+ 		}
+ 
+ 		Z_STRVAL_P(result) = safe_erealloc(Z_STRVAL_P(result), res_len, 1, 1);
+@@ -1478,7 +1478,7 @@
+ 		char *buf;
+ 
+ 		if (Z_STRLEN_P(op1) < 0 || Z_STRLEN_P(op2) < 0 || (int) (Z_STRLEN_P(op1) + Z_STRLEN_P(op2)) < 0) {
+-			zend_error(E_ERROR, "String size overflow");
++			zend_mm_safe_error_ex("String size overflow");
+ 		}
+ 		buf = (char *) safe_emalloc(length, 1, 1);
+ 
+--- a/main/rfc1867.c
++++ b/main/rfc1867.c
+@@ -383,6 +383,17 @@
+ }
+ 
+ /* finds a boundary */
++/* GHSA-6wmf-4rv5-p3rp (CVE-2026-109619) backport: keep only headers we
++ * actually use, and drop duplicates, to shrink the parser's state and
++ * allocation footprint during SAPI startup. */
++static zend_bool php_mime_should_save_hdr(const char *name)
++{
++	return !strcasecmp(name, "Content-Disposition")
++		|| !strcasecmp(name, "Content-Type");
++}
++
++static char *php_mime_get_hdr_value(zend_llist header, char *key);
++
+ static int find_boundary(multipart_buffer *self, char *boundary TSRMLS_DC)
+ {
+ 	char *line;
+@@ -441,10 +452,16 @@
+ 			}
+ 
+ 			*value = '\0';
+-			do { value++; } while(isspace(*value));
+ 
+-			key = estrdup(line);
+-			smart_str_appends(&buf_value, value);
++			/* Keep only headers we use, and ignore duplicates */
++			if (!php_mime_should_save_hdr(line)
++					|| php_mime_get_hdr_value(*header, line)) {
++				key = NULL;
++			} else {
++				key = estrdup(line);
++				do { value++; } while(isspace((unsigned char)*value));
++				smart_str_appends(&buf_value, value);
++			}
+ 		} else if (buf_value.c) { /* If no ':' on the line, add to previous line */
+ 			smart_str_appends(&buf_value, line);
+ 		} else {
+@@ -517,11 +534,11 @@
+ 	return res;
+ }
+ 
+-static char *substring_conf(char *start, int len, char quote)
++static char *substring_conf(char *start, size_t len, char quote)
+ {
+ 	char *result = emalloc(len + 1);
+ 	char *resp = result;
+-	int i;
++	size_t i;
+ 
+ 	for (i = 0; i < len && start[i] != quote; ++i) {
+ 		if (start[i] == '\\' && (start[i + 1] == '\\' || (quote && start[i + 1] == quote))) {
+@@ -556,7 +573,7 @@
+ 		while (*strend && !isspace(*strend)) {
+ 			++strend;
+ 		}
+-		return substring_conf(str, strend - str, 0);
++		return substring_conf(str, (size_t)(strend - str), 0);
+ 	}
+ }
+ 
+@@ -696,6 +713,8 @@
+ 	void *event_extra_data = NULL;
+ 	unsigned int llen = 0;
+ 	int upload_cnt = INI_INT("max_file_uploads");
++	int body_parts_cnt = INI_INT("max_multipart_body_parts");
++	int body_parts_limit;
+ 	const zend_encoding *internal_encoding = zend_multibyte_get_internal_encoding(TSRMLS_C);
+ 	php_rfc1867_getword_t getword;
+ 	php_rfc1867_getword_conf_t getword_conf;
+@@ -784,6 +803,11 @@
+ 		}
+ 	}
+ 
++	if (body_parts_cnt < 0) {
++		body_parts_cnt = PG(max_input_vars) + upload_cnt;
++	}
++	body_parts_limit = body_parts_cnt;
++
+ 	while (!multipart_buffer_eof(mbuff TSRMLS_CC))
+ 	{
+ 		char buff[FILLUNIT];
+@@ -793,6 +817,11 @@
+ 
+ 		zend_llist_clean(&header);
+ 
++		if (--body_parts_cnt < 0) {
++			php_error_docref(NULL TSRMLS_CC, E_WARNING, "Multipart body parts limit exceeded %d. To increase the limit change max_multipart_body_parts in php.ini.", body_parts_limit);
++			goto fileupload_done;
++		}
++
+ 		if (!multipart_buffer_headers(mbuff, &header TSRMLS_CC)) {
+ 			goto fileupload_done;
+ 		}
+--- a/main/main.c
++++ b/main/main.c
+@@ -548,6 +548,7 @@
+ /* {{{ PHP_INI
+  */
+ PHP_INI_BEGIN()
++	PHP_INI_ENTRY("max_multipart_body_parts",	"-1",			PHP_INI_SYSTEM|PHP_INI_PERDIR,		NULL)
+ 	PHP_INI_ENTRY_EX("highlight.comment",		HL_COMMENT_COLOR,	PHP_INI_ALL,	NULL,			php_ini_color_displayer_cb)
+ 	PHP_INI_ENTRY_EX("highlight.default",		HL_DEFAULT_COLOR,	PHP_INI_ALL,	NULL,			php_ini_color_displayer_cb)
+ 	PHP_INI_ENTRY_EX("highlight.html",			HL_HTML_COLOR,		PHP_INI_ALL,	NULL,			php_ini_color_displayer_cb)
+@@ -1784,6 +1785,9 @@
+ 		for (i = 0; i < NUM_TRACK_VARS; i++) {
+ 			if (PG(http_globals)[i]) {
+ 				zval_ptr_dtor(&PG(http_globals)[i]);
++				/* May be accessed before php_request_startup()
++				 * (GHSA-6wmf-4rv5-p3rp / CVE-2026-109619) */
++				PG(http_globals)[i] = NULL;
+ 			}
+ 		}
+ 	} zend_end_try();
+@@ -1880,6 +1884,9 @@
+ 		for (i=0; i<NUM_TRACK_VARS; i++) {
+ 			if (PG(http_globals)[i]) {
+ 				zval_ptr_dtor(&PG(http_globals)[i]);
++				/* May be accessed before php_request_startup()
++				 * (GHSA-6wmf-4rv5-p3rp / CVE-2026-109619) */
++				PG(http_globals)[i] = NULL;
+ 			}
+ 		}
+ 	} zend_end_try();
+@@ -1937,6 +1944,10 @@
+ #ifdef HAVE_DTRACE
+ 	DTRACE_REQUEST_SHUTDOWN(SAFE_FILENAME(SG(request_info).path_translated), SAFE_FILENAME(SG(request_info).request_uri), (char *)SAFE_FILENAME(SG(request_info).request_method));
+ #endif /* HAVE_DTRACE */
++
++	/* May be accessed before php_request_startup()
++	 * (GHSA-6wmf-4rv5-p3rp / CVE-2026-109619) */
++	PG(modules_activated) = 0;
+ }
+ /* }}} */
+ 
+--- a/main/SAPI.c
++++ b/main/SAPI.c
+@@ -528,18 +528,23 @@
+ 	}
+ 	if (SG(request_info).auth_user) {
+ 		efree(SG(request_info).auth_user);
++		SG(request_info).auth_user = NULL;
+ 	}
+ 	if (SG(request_info).auth_password) {
+ 		efree(SG(request_info).auth_password);
++		SG(request_info).auth_password = NULL;
+ 	}
+ 	if (SG(request_info).auth_digest) {
+ 		efree(SG(request_info).auth_digest);
++		SG(request_info).auth_digest = NULL;
+ 	}
+ 	if (SG(request_info).content_type_dup) {
+ 		efree(SG(request_info).content_type_dup);
++		SG(request_info).content_type_dup = NULL;
+ 	}
+ 	if (SG(request_info).current_user) {
+ 		efree(SG(request_info).current_user);
++		SG(request_info).current_user = NULL;
+ 	}
+ 	if (sapi_module.deactivate) {
+ 		sapi_module.deactivate(TSRMLS_C);
+--- a/main/php_variables.c
++++ b/main/php_variables.c
+@@ -56,6 +56,17 @@
+ 	php_register_variable_ex(var, &new_entry, track_vars_array TSRMLS_CC);
+ }
+ 
++/* Input arrays start with the smallest hash table size instead of the default
++ * of 8, to limit the memory used by deeply nested input. A table size of 1 is
++ * not possible here as an nTableMask of 0 marks the table as uninitialized.
++ * (Backport of array_init_singleton from the PHP-7.4 CVE-2026-109618/109619
++ * security branch.) */
++static void array_init_singleton(zval *arg)
++{
++	array_init(arg);
++	Z_ARRVAL_P(arg)->nTableSize = 2;
++}
++
+ PHPAPI void php_register_variable_ex(char *var_name, zval *val, zval *track_vars_array TSRMLS_DC)
+ {
+ 	char *p = NULL;
+@@ -176,7 +187,7 @@
+ 
+ 			if (!index) {
+ 				MAKE_STD_ZVAL(gpc_element);
+-				array_init(gpc_element);
++				array_init_singleton(gpc_element);
+ 				if (zend_hash_next_index_insert(symtable1, &gpc_element, sizeof(zval *), (void **) &gpc_element_p) == FAILURE) {
+ 					zval_ptr_dtor(&gpc_element);
+ 					zval_dtor(val);
+@@ -187,7 +198,7 @@
+ 				if (zend_symtable_find(symtable1, index, index_len + 1, (void **) &gpc_element_p) == FAILURE
+ 					|| Z_TYPE_PP(gpc_element_p) != IS_ARRAY) {
+ 					MAKE_STD_ZVAL(gpc_element);
+-					array_init(gpc_element);
++					array_init_singleton(gpc_element);
+ 					zend_symtable_update(symtable1, index, index_len + 1, &gpc_element, sizeof(zval *), (void **) &gpc_element_p);
+ 				}
+ 			}
+@@ -379,7 +390,7 @@
+ 		case PARSE_GET:
+ 		case PARSE_COOKIE:
+ 			ALLOC_ZVAL(array_ptr);
+-			array_init(array_ptr);
++			array_init_singleton(array_ptr);
+ 			INIT_PZVAL(array_ptr);
+ 			switch (arg) {
+ 				case PARSE_POST:
+--- a/ext/session/session.c
++++ b/ext/session/session.c
+@@ -2669,7 +2669,11 @@
+ 	if (php_session_rfc1867_orig_callback) {
+ 		retval = php_session_rfc1867_orig_callback(event, event_data, extra TSRMLS_CC);
+ 	}
+-	if (!PS(rfc1867_enabled)) {
++	/* GHSA-6wmf-4rv5-p3rp (CVE-2026-109619) backport: unconditionally
++	 * disable the rfc1867 upload-progress session write path. This code
++	 * runs during SAPI startup, before normal request initialization,
++	 * and pollutes global session state across requests. */
++	if (!PS(rfc1867_enabled) || 1) {
+ 		return retval;
+ 	}
+ 
+--- a/php.ini-development
++++ b/php.ini-development
+@@ -822,6 +822,11 @@
+ ; Maximum number of files that can be uploaded via a single request
+ max_file_uploads = 20
+ 
++; Maximum number of multipart body parts in a single POST request.
++; -1 means the default limit: max_input_vars + max_file_uploads.
++; (GHSA-6wmf-4rv5-p3rp / CVE-2026-109619 hardening)
++max_multipart_body_parts = -1
++
+ ;;;;;;;;;;;;;;;;;;
+ ; Fopen wrappers ;
+ ;;;;;;;;;;;;;;;;;;
+--- a/php.ini-production
++++ b/php.ini-production
+@@ -822,6 +822,11 @@
+ ; Maximum number of files that can be uploaded via a single request
+ max_file_uploads = 20
+ 
++; Maximum number of multipart body parts in a single POST request.
++; -1 means the default limit: max_input_vars + max_file_uploads.
++; (GHSA-6wmf-4rv5-p3rp / CVE-2026-109619 hardening)
++max_multipart_body_parts = -1
++
+ ;;;;;;;;;;;;;;;;;;
+ ; Fopen wrappers ;
+ ;;;;;;;;;;;;;;;;;;
