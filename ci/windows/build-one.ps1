@@ -8,6 +8,8 @@ $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'common.ps1')
 if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { throw 'Windows build requires Windows' }
 $repo=(Get-Location).Path
+$version=(& python (Join-Path $PSScriptRoot '../release/version.py')).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Source version definitions are invalid' }
 $key=$Arch+'-'+$Threading
 $out=Join-Path $repo ('artifacts\windows\'+$key)
 $evidence=Join-Path $out 'evidence'
@@ -64,7 +66,7 @@ try {
         $files[$_.Name]=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     $manifest=[ordered]@{
-        version='5.6.40-sec1'; upstream_base='5.6.40'; source_commit=$commit;
+        version=$version; upstream_base='5.6.40'; source_commit=$commit;
         platform='Windows'; arch=$Arch; threading=$Threading; compiler='VC11'; profile='core'; status='candidate';
         toolchain=$tools; verification=(Get-Content -LiteralPath $verification -Raw | ConvertFrom-Json);
         cve_security_validation='not performed'; runtime_requirement='Visual C++ 2012 Runtime matching package architecture';
@@ -74,15 +76,15 @@ try {
     }
     $manifest | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath (Join-Path $stage 'MANIFEST.json') -Encoding UTF8
     Copy-Item -LiteralPath $verification -Destination $stage
-    @'
-Unofficial PHP 5.6.40-sec1 Windows core candidate.
+    @"
+Unofficial PHP $version Windows core candidate.
 Contains CLI, CGI, matching PHP DLL, LICENSE and a configuration example.
 Install the matching x86/x64 Microsoft Visual C++ 2012 runtime before deployment.
 Core-only: OpenSSL, cURL, GD, ZIP, third-party loaders and Apache module are absent.
 This package passed the checks recorded in verification.json, not a complete CVE or production acceptance.
-'@ | Set-Content -LiteralPath (Join-Path $stage 'README.txt') -Encoding UTF8
+"@ | Set-Content -LiteralPath (Join-Path $stage 'README.txt') -Encoding UTF8
     New-Item -ItemType Directory -Force $binaryOut | Out-Null
-    $name='php-5.6.40-sec1-windows-vc11-'+$Arch+'-'+$Threading+'-core-candidate.zip'
+    $name='php-'+$version+'-windows-vc11-'+$Arch+'-'+$Threading+'-core-candidate.zip'
     $zip=Join-Path $binaryOut $name
     Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
     $hash=(Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()

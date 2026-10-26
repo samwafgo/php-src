@@ -7,6 +7,10 @@ import os
 from pathlib import Path
 import subprocess
 import tarfile
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from release.version import read_version
 
 p=argparse.ArgumentParser()
 p.add_argument('output',type=Path)
@@ -17,12 +21,13 @@ p.add_argument('image_digest')
 p.add_argument('patch',type=Path)
 a=p.parse_args()
 out=a.output.resolve()
-name='php-5.6.40-sec1-'+a.target+'-'+a.profile+'-candidate'
+version=read_version()
+name='php-'+version+'-'+a.target+'-'+a.profile+'-candidate'
 package=out/'package'
 def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 def text(name): return (out/name).read_text().strip()
 results=json.loads(text('test-results.json'))
-manifest=dict(version='5.6.40-sec1',upstream_base='5.6.40',target=a.target,
+manifest=dict(version=version,upstream_base='5.6.40',target=a.target,
     profile=a.profile,status='candidate',source_commit=a.source_commit,
     source_repository='https://github.com/samwafgo/php-src',
     patch_sha256=sha(a.patch),container_image_digest=a.image_digest,
@@ -42,9 +47,9 @@ manifest=dict(version='5.6.40-sec1',upstream_base='5.6.40',target=a.target,
       'not a drop-in replacement for an existing Baota PHP installation'],
     binaries={f:sha(package/f) for f in ['bin/php','bin/php-cgi','sbin/php-fpm']})
 (package/'MANIFEST.json').write_text(json.dumps(manifest,indent=2)+'\n')
-(package/'README.txt').write_text('PHP 5.6.40-sec1 unofficial candidate\n'
+(package/'README.txt').write_text('PHP '+version+' unofficial candidate\n'
     'Target: '+a.target+'; profile: '+a.profile+'\n'
-    'Install prefix compiled in: /opt/samwaf/php56/5.6.40-sec1\n'
+    'Install prefix compiled in: /opt/samwaf/php56/'+version+'\n'
     'This package is staged, not installed. Existing services were not changed.\n'
     'Use bin/php -c /absolute/path/etc/php.ini to select your reviewed config.\n'
     'See MANIFEST.json for extensions, hashes, test failures and limitations.\n'

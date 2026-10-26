@@ -3,9 +3,11 @@ import json
 import os
 from pathlib import Path
 import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from release.version import read_version
 
 root=Path(sys.argv[1])
-lines=['### Windows PHP 5.6.40-sec1 core candidates','',
+lines=['### Windows PHP '+read_version()+' core candidates','',
        '| Configuration | Actual result |','|---|---|']
 for key in ['x86-nts','x86-ts','x64-nts','x64-ts']:
     file=root/key/'evidence/status.json'

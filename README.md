@@ -1,6 +1,13 @@
-# PHP 5.6 Security Backport — CVE-2026-109618 / CVE-2026-109619
+# PHP 5.6 Community Security Backports
 
-> 📌 **你正在查看的是安全回移分支 `PHP-5.6-CVE-2026-109618-109619`,不是上游 php-src 主分支。**
+长期维护采用 `PHP-5.6-security`，以 `5.6.40-sec1`、`sec2`、`sec3` 累积修订。
+每次发布使用独立 Tag `php-5.6.40-secN`，固定源码和二进制资源。
+首次迁移、后续补丁与自动发布操作见 **[维护与发布指南](docs/RELEASING.md)**。
+
+Actions 的 `release-php56-sec` 将从同一提交构建 15 个 Linux 包和 4 个 Windows 包，核对清单后上传源码、补丁、二进制和 SHA256SUMS 并发布。
+下文保留 sec1 最初两项 CVE 修复的背景和实现说明。
+
+> 📌 **本仓库用于 PHP 5.6 社区安全维护；最初的回移分支为 `PHP-5.6-CVE-2026-109618-109619`，长期入口迁移到 `PHP-5.6-security`。**
 > 本 README 替换了上游构建说明;原版说明请切换到
 > [`php-5.6.40`](https://github.com/php/php-src/tree/php-5.6.40) tag 查看。
 

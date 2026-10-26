@@ -7,7 +7,8 @@ profile=$3
 cd "$src"
 mkdir -p "$out"
 exec > >(tee "$out/build.log") 2>&1
-prefix=/opt/samwaf/php56/5.6.40-sec1
+version=$(python3 ci/release/version.py)
+prefix=/opt/samwaf/php56/$version
 case "$profile" in
   debug-test) extra=(--enable-debug);;
   web-release) extra=(--disable-debug --enable-filter --enable-json --enable-hash
@@ -28,11 +29,11 @@ ${CC:-cc} $CFLAGS -I. ci/multibuild/test_multiply.c -o "$out/test-multiply"
 make -j"${BUILD_JOBS:-2}" > "$out/make.log" 2>&1 || { tail -n 100 "$out/make.log"; exit 1; }
 chmod 0755 sapi/cli/php sapi/cgi/php-cgi sapi/fpm/php-fpm
 ./sapi/cli/php -n -v | tee "$out/version.txt"
-grep -Fq 'PHP 5.6.40-sec1' "$out/version.txt"
+grep -Fq "PHP $version" "$out/version.txt"
 ./sapi/cli/php -n -m > "$out/modules.txt"
 ./sapi/cli/php -n -i > "$out/php-info.txt"
 grep -Fq 'max_multipart_body_parts' "$out/php-info.txt"
-./sapi/cli/php -n -r 'if (PHP_VERSION !== "5.6.40-sec1" || !extension_loaded("session")) exit(1); echo "runtime-ok\n";'
+./sapi/cli/php -n -r 'if (PHP_VERSION !== $argv[1] || !extension_loaded("session")) exit(1); echo "runtime-ok\n";' -- "$version"
 if [[ "$profile" == web-release ]]; then
   ./sapi/cli/php -n -r '$mods=array("filter","json","hash","mbstring","bcmath","sockets","ctype","tokenizer","PDO","mysqli","pdo_mysql","mysql","zlib","libxml","dom","xml","SimpleXML","xmlreader","xmlwriter"); foreach($mods as $m) if(!extension_loaded($m)){fwrite(STDERR,"Missing: ".$m."\n");exit(1);} echo "modules-ok\n";'
 fi

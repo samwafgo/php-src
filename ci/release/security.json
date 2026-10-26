@@ -1,0 +1,5 @@
+{
+  "upstream_base": "5.6.40",
+  "maintenance_branch": "PHP-5.6-security",
+  "cumulative_patch": "security-backports/php-5.6.40-cumulative.patch"
+}

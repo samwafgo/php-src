@@ -8,6 +8,10 @@ from pathlib import Path
 import struct
 import subprocess
 import tempfile
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from release.version import read_version
 
 def pe_architecture(file):
     with file.open('rb') as f:
@@ -41,6 +45,7 @@ def parse_cgi(stdout):
     return body.decode().strip()
 
 def verify(package, arch, threading):
+    version=read_version()
     package=package.resolve()
     php=package/'php.exe'
     cgi=package/'php-cgi.exe'
@@ -54,10 +59,10 @@ def verify(package, arch, threading):
     integer_bits='32'
     code='echo PHP_VERSION,"|",(PHP_ZTS?"ts":"nts"),"|",PHP_INT_SIZE*8,"|",(extension_loaded("session")?"session":"missing");'
     cli=run([str(php),'-n','-r',code],cwd=str(package)).decode().strip()
-    if cli!='5.6.40-sec1|'+threading+'|'+integer_bits+'|session':
+    if cli!=version+'|'+threading+'|'+integer_bits+'|session':
         raise ValueError('Version/threading/integer-width/session mismatch: '+cli)
     for binary in [php,cgi]:
-        if 'PHP 5.6.40-sec1' not in run([str(binary),'-n','-v'],cwd=str(package)).decode():
+        if ('PHP '+version+' ') not in (run([str(binary),'-n','-v'],cwd=str(package)).decode().strip()+' '):
             raise ValueError('Wrong PHP version: '+binary.name)
     with tempfile.TemporaryDirectory(prefix='php56-cgi-') as folder:
         root=Path(folder)
@@ -84,7 +89,7 @@ echo $f['name'],'|',$f['error'],'|',md5_file($f['tmp_name']),'|',$_SESSION['coun
         for i in (1,2):
             response=parse_cgi(run([str(cgi),'-n'],input=body,env=env,cwd=str(package)))
             expected='|'.join(['safe.txt','0',hashlib.md5(payload).hexdigest(),str(i),'0',
-                               '5.6.40-sec1',threading,integer_bits])
+                               version,threading,integer_bits])
             if response!=expected: raise ValueError('CGI upload/session check mismatch: '+response)
     return dict(status='PASS',cli=cli,pe_architecture=arch,threading=threading,
                 php_integer_bits=int(integer_bits),

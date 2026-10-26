@@ -16,14 +16,13 @@ mkdir -p "$out"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 commit=$(git rev-parse HEAD)
-python3 ci/prepare-git-patch.py --source security-backports/php-5.6.40-CVE-2026-109618-109619.patch \
-  --output "$work/git.patch"
-git apply --reverse --check "$work/git.patch"
-grep -Fq '#define PHP_VERSION "5.6.40-sec1"' main/php_version.h
+python3 ci/release/check_source.py
+security_patch=$(python3 ci/release/version.py --patch)
 # Archive tracked source only; overlay this invocation's build tooling for local review.
 mkdir "$work/src"
 git archive HEAD | tar -x -C "$work/src"
 cp -a ci/multibuild "$work/src/ci/"
+cp -a ci/release "$work/src/ci/"
 curl -fLsS --retry 3 --connect-timeout 15 --max-time 180 \
   https://museum.php.net/php5/php-5.6.40.tar.xz -o "$work/php-5.6.40.tar.xz"
 python3 ci/multibuild/prepare_parsers.py "$work/php-5.6.40.tar.xz" "$work/src" "$out/parser-provenance.json"
@@ -50,5 +49,5 @@ else
      bash /work/ci/multibuild/runtime.sh && bash /work/ci/multibuild/verify-package.sh /out/package /out "$1"' _ "$target"
 fi
 python3 ci/multibuild/finalize.py "$out" "$target" "$profile" "$commit" "$digest" \
-  security-backports/php-5.6.40-CVE-2026-109618-109619.patch
+  "$security_patch"
 echo "Validated candidate: $out/binaries"

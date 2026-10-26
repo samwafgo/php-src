@@ -1,6 +1,17 @@
 name: build-multi-php56-candidates
 
 on:
+  workflow_call:
+    inputs:
+      scope:
+        type: string
+        default: all
+      profile:
+        type: string
+        default: web-release
+      source_ref:
+        type: string
+        default: ''
   workflow_dispatch:
     inputs:
       scope:
@@ -14,8 +25,8 @@ on:
         options: [web-release, debug-test]
         default: web-release
   push:
-    branches: [PHP-5.6-CVE-2026-109618-109619]
-    paths: [.github/workflows/build-multi-php56.yml, 'ci/multibuild/**']
+    branches: [PHP-5.6-security, PHP-5.6-CVE-2026-109618-109619]
+    paths: [.github/workflows/build-multi-php56.yml, 'ci/multibuild/**', 'ci/release/**', 'security-backports/**', main/php_version.h, configure.in]
 
 permissions:
   contents: read
@@ -28,6 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.source_ref || github.sha }}
           persist-credentials: false
       - id: matrix
         shell: bash
@@ -35,7 +47,7 @@ jobs:
           SCOPE: ${{ inputs.scope || 'all' }}
         run: |
           set -euo pipefail
-          test "${GITHUB_REF_NAME}" = PHP-5.6-CVE-2026-109618-109619
+          python3 ci/release/check_source.py
           python3 ci/multibuild/test_validation.py
           echo "matrix=$(python3 ci/multibuild/matrix.py "$SCOPE")" >> "$GITHUB_OUTPUT"
 
@@ -53,6 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.source_ref || github.sha }}
           persist-credentials: false
       - name: Build, validate PHPT, and test package in clean runtime
         shell: bash

@@ -11,11 +11,13 @@ import io
 import runpy
 import subprocess
 import sys
+import re
 
 BASE=Path(__file__).resolve().parent
 spec=importlib.util.spec_from_file_location('verify_windows',BASE/'verify_windows.py')
 v=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(v)
+VERSION=v.read_version()
 
 def pe(path,machine):
     data=bytearray(256)
@@ -31,14 +33,14 @@ class VerificationTests(unittest.TestCase):
         def output(argv, **kwargs):
             nonlocal counter
             if '-r' in argv:
-                return ('5.6.40-sec1|'+threading+'|'+str(integer_bits)+'|session').encode()
+                return (VERSION+'|'+threading+'|'+str(integer_bits)+'|session').encode()
             if '-v' in argv:
-                return b'PHP 5.6.40-sec1'
+                return ('PHP '+VERSION).encode()
             counter+=1
             self.assertEqual(Path(argv[0]).name,'php-cgi.exe')
             self.assertIn(b'filename="safe.txt"',kwargs['input'])
             body='|'.join(['safe.txt','0',v.hashlib.md5(b'ordinary-php56-windows-upload\n').hexdigest(),
-                           str(counter),'0','5.6.40-sec1',threading,str(cgi_integer_bits)])
+                           str(counter),'0',VERSION,threading,str(cgi_integer_bits)])
             return b'Content-Type: text/plain\r\n\r\n'+body.encode()
         return output
     def windows_package(self, package, arch, threading):
@@ -54,7 +56,7 @@ class VerificationTests(unittest.TestCase):
                         result=v.verify(package,arch,threading)
                     self.assertEqual(result['status'],'PASS')
                     self.assertEqual(result['pe_architecture'],arch)
-                    self.assertEqual(result['cli'],'5.6.40-sec1|'+threading+'|32|session')
+                    self.assertEqual(result['cli'],VERSION+'|'+threading+'|32|session')
                     self.assertEqual(runtime.call_count,5) # CLI, two versions, two CGI uploads
     def test_mixed_x86_binaries_still_rejected_in_x64_package(self):
         for name in ('php.exe','php-cgi.exe','php5.dll'):
@@ -77,8 +79,9 @@ class VerificationTests(unittest.TestCase):
     def generate_patch(self, destination, simulate_windows=False):
         root=BASE.parent.parent
         helper=root/'ci/prepare-git-patch.py'
-        args=[str(helper),'--source',str(root/'security-backports/php-5.6.40-CVE-2026-109618-109619.patch'),
-              '--output',str(destination)]
+        config=json.loads((root/'ci/release/security.json').read_text())
+        args=[str(helper),'--source',str(root/config['cumulative_patch']),
+              '--output',str(destination),'--allow-missing-configure']
         original_write_text=Path.write_text
         def windows_text_write(path,data,*positional,**kwargs):
             # Reproduce Windows text-mode translation even when tests run on Linux.
@@ -97,13 +100,16 @@ class VerificationTests(unittest.TestCase):
             data=p.read_bytes()
             self.assertNotIn(b'\r',data)
             self.assertFalse(data.startswith(b'\xef\xbb\xbf'))
-            self.assertEqual(data.count(b'--- a/'),16)
+            root=BASE.parent.parent
+            config=json.loads((root/'ci/release/security.json').read_text())
+            paths=re.findall(r'^--- a/(.+)$',(root/config['cumulative_patch']).read_text(),re.M)
+            self.assertEqual(data.count(b'--- a/'),len([p for p in paths if p!='configure']))
             self.assertNotIn(b'--- a/configure\n',data)
     def test_generated_patch_passes_original_strict_reverse_check(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/'git.patch'
             self.generate_patch(p)
-            result=subprocess.run(['git','apply','--reverse','--check',str(p)],
+            result=subprocess.run([sys.executable,str(BASE.parent/'release/check_source.py')],
                 cwd=BASE.parent.parent,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             self.assertEqual(result.returncode,0,result.stderr)
     def test_both_pe_architectures(self):
@@ -135,13 +141,13 @@ class VerificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             package=Path(d)
             for file in ('php.exe','php-cgi.exe','php5.dll'):pe(package/file,0x8664)
-            with patch.object(v,'run',return_value=b'5.6.40|nts|64|session'):
+            with patch.object(v,'run',return_value=b'5.6.40|nts|32|session'):
                 with self.assertRaisesRegex(ValueError,'mismatch'):v.verify(package,'x64','nts')
     def test_wrong_runtime_threading_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             package=Path(d)
             for file in ('php.exe','php-cgi.exe','php5ts.dll'):pe(package/file,0x8664)
-            with patch.object(v,'run',return_value=b'5.6.40-sec1|nts|64|session'):
+            with patch.object(v,'run',return_value=(VERSION+'|nts|32|session').encode()):
                 with self.assertRaisesRegex(ValueError,'mismatch'):v.verify(package,'x64','ts')
     def test_missing_php_dll_rejected(self):
         with tempfile.TemporaryDirectory() as d:

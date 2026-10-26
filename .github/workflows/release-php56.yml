@@ -1,0 +1,78 @@
+name: release-php56-sec
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['php-5.6.40-sec*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: php56-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      sha: ${{ steps.release.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 ci/release/test_release.py
+      - id: release
+        run: python3 ci/release/prepare.py
+
+  linux:
+    needs: prepare
+    uses: ./.github/workflows/build-multi-php56.yml
+    with:
+      scope: all
+      profile: web-release
+      source_ref: ${{ needs.prepare.outputs.sha }}
+
+  windows:
+    needs: prepare
+    uses: ./.github/workflows/build-multi-windows-php56.yml
+    with:
+      source_ref: ${{ needs.prepare.outputs.sha }}
+
+  publish:
+    needs: [prepare, linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    concurrency:
+      group: php56-publish-${{ needs.prepare.outputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: php56-*-candidate
+          path: release-downloads
+          merge-multiple: false
+      - name: Validate all 19 packages and prepare versioned release assets
+        env:
+          SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
+        run: python3 ci/release/assemble.py --download release-downloads --output release-assets --commit "$SOURCE_SHA"
+      - name: Create immutable-by-policy tag and publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/release/publish.py
